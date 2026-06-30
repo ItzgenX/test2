@@ -1,0 +1,13 @@
+defaults:
+  - _self_
+
+# Live SegFormer-Cityscapes encoder (Stage D), the seg twin of midas.yaml.
+# Plugs into the same lora.struct.encoder slot; satisfies the same interface
+# (in [-1,1] [B,3,H,W] -> out [0,1] [B,3,size,size] colour map). See Q-SEGENC.
+_target_: src.encoders.seg_encoder.SegmentationEncoder
+# LOCKED MODEL: b5 chosen for best boundary accuracy on driving-scene classes
+# (pedestrians, vehicles, traffic lights). See references.md §9 for the
+# depth-vs-seg design note — b5 gives the seg pipeline its best shot.
+model: nvidia/segformer-b5-finetuned-cityscapes-1024-1024
+size: ${size}
+local_files_only: ${local_files_only}

@@ -1,0 +1,202 @@
+# @package _global_
+
+defaults:
+  - /lora@lora.struct: struct
+  - override /lora/encoder@lora.struct.encoder: midas
+  - override /model: sd15
+  - override /data: local_depth
+  - _self_
+
+# =============================================================================
+# MODEL LOADING — LOCAL vs INTERNET  (one switch: local_files_only)
+# =============================================================================
+# Both the local folder AND the hub id are listed below; the flag picks which.
+#   local_files_only: true   -> use the LOCAL folders (*_model_path). Fully
+#                              offline, no network.
+#   local_files_only: false  -> use the HUB ids (*_model_name); downloads if missing.
+# The actual choice is made in train_depth.py (a couple of lines that read this
+# flag and set model.model_name / encoder.model before the model is built).
+# Local paths are relative to the repo root; the code makes them absolute.
+local_files_only: true
+
+base_model_name:  runwayml/stable-diffusion-v1-5
+base_model_path:  checkpoints/local_models/stable-diffusion-v1-5
+depth_model_name: Intel/dpt-hybrid-midas
+depth_model_path: checkpoints/local_models/dpt-hybrid-midas
+
+# =============================================================================
+# HARDWARE  —  works for BOTH setups (each GPU is 12 GB)
+# =============================================================================
+# These per-GPU memory settings are sized for a single 12 GB card and are SAFE
+# to reuse unchanged on the 4×12 GB cluster, because each cluster GPU is also
+# 12 GB — only the LAUNCH COMMAND changes, not the memory knobs.
+#
+#   SINGLE 12 GB GPU (local):
+#     python train_depth.py experiment=train_depth
+#     effective batch = batch_size(4) x grad_accum(4)            = 16
+#
+#   4 x 12 GB GPUs (cluster) — Accelerate spawns one process per GPU and
+#   averages gradients, so the per-GPU memory footprint is IDENTICAL:
+#     accelerate launch --num_processes=4 train_depth.py experiment=train_depth
+#     effective batch = batch_size(4) x grad_accum(4) x gpus(4) = 64
+#     # With 4x the effective batch you may scale the LR up by ~sqrt(4)=2:
+#     #   learning_rate: 2.0e-4
+#     #   lr_warmup_steps: 150
+#     # and you can usually drop grad accumulation since 4 GPUs already give 16:
+#     #   gradient_accumulation_steps: 1
+#
+# OOM SAFETY: if you still hit out-of-memory on 12 GB, lower in this order:
+#   1) data.batch_size: 2        (then 1)
+#   2) keep gradient_checkpointing: true   (do NOT turn this off on 12 GB)
+#   3) keep bf16: true
+gradient_checkpointing: true          # REQUIRED on 12 GB — saves ~1.5 GB VRAM at ~20% compute cost
+gradient_accumulation_steps: 4        # 4 bsz x 4 grad acc = 16 effective batch (single 12 GB)
+# gradient_accumulation_steps: 1      # cluster (4 GPUs already give effective batch 16)
+size: 512                             # square canvas; must match SD1.5 native resolution
+
+# =============================================================================
+# 1. GENERAL TRAINING PARAMETERS
+# =============================================================================
+#
+# ── DATASET MATH (60K train / 4K val / 4K test) ──────────────────────────────
+#   single  : effective batch 16 -> 60,000 / 16 = 3,750 optimizer steps / epoch
+#   cluster : effective batch 64 -> 60,000 / 64 =   938 optimizer steps / epoch
+#
+# ── CHECKPOINT & IMAGE SAVE SCHEDULE ────────────────────────────────────────
+#   A checkpoint (+ its N monitoring images) is saved every `val_steps`, plus once
+#   per epoch, plus best_model/ when val loss improves, plus a final checkpoint.
+#   To save MORE often lower val_steps; to save LESS often raise it.
+#
+# ── OUTPUT FOLDER LAYOUT ─────────────────────────────────────────────────────
+#   outputs/train/${tag}/runs/YYYY-MM-DD/HH-MM-SS/
+#     checkpoint-*/                 ← LoRA + mapper weights AND that checkpoint's
+#                                     sample_NN_fixed/new.jpg images + prompts.txt
+#     best_model/                   ← same, for the lowest val-loss epoch (+ info.txt)
+# ─────────────────────────────────────────────────────────────────────────────
+
+learning_rate: 1.0e-4
+lr_warmup_steps: 500                  # ~13 % of epoch 1 (500 / 3750 steps); reasonable ramp
+lr_scheduler: cosine                  # decays 1e-4 → ~0 over the full training run
+
+epochs: 5                             # 5 × 3,750 = 18,750 optimizer steps total (12 GB GPU)
+
+# ── VALIDATION vs CHECKPOINT SAVING — TWO INDEPENDENT KNOBS ───────────────────
+# These are DECOUPLED (see train_depth.py loop):
+#
+#   val_steps  : how often to COMPUTE val/loss (cheap). Every val_steps the model
+#                is evaluated on held-out data, val/loss is logged to TensorBoard,
+#                and best_model/ is updated IF val/loss improved. No step folder
+#                is written here. Lower for a denser val/loss curve.
+#
+#   ckpt_steps : how often to SAVE a checkpoint (heavy: weights + N monitoring
+#                images) into checkpoint-epoch{N}/step{step}/. Raise to save less
+#                often (less disk); lower to save more.
+#
+# ── 60 K DATASET MATH ────────────────────────────────────────────────────────
+#
+#   SINGLE 12 GB GPU (current setup):
+#     effective batch = batch_size(4) × grad_accum(4) = 16
+#     steps / epoch   = 60,000 / 16 = 3,750
+#     val_steps  = 500  →  7–8 val/loss checks per epoch
+#     ckpt_steps = 1000 →  3–4 step-level checkpoint saves per epoch
+#     launch: python train_depth.py experiment=train_depth
+#
+#   4 × 12 GB GPU CLUSTER (if available later):
+#     Keep accum=4 so each update uses a bigger batch and training is more stable.
+#     Adjust knobs:
+#     #   learning_rate: 2.0e-4            # √4 × 1e-4 (batch 64 vs 16 → scale LR)
+#     #   lr_warmup_steps: 150             # shorter warmup for the higher LR
+#     #   val_steps:  100                  # 938/100 → ~9 val checks per epoch
+#     #   ckpt_steps: 250                  # 938/250 → ~3 step-saves per epoch
+#     effective batch = batch_size(4) × accum(4) × gpus(4) = 64
+#     steps / epoch   = 60,000 / 64 = 938   (4 GPUs also cut wall-clock ~4×)
+#     launch: accelerate launch --num_processes=4 train_depth.py experiment=train_depth
+#
+#   EVERY epoch always saves its checkpoint-epochN/ end folder regardless of
+#   val_steps/ckpt_steps. best_model/ is saved whenever val/loss improves.
+val_steps:  500                       # compute val/loss (+ maybe best_model) every N steps
+ckpt_steps: 1000                      # write weights + images to disk every N steps
+
+# =============================================================================
+# 2. DATA TRACKING LAYER (JSON manifest)
+# =============================================================================
+#   JSON keys read by DepthJsonDataset (src/data/local.py):
+#     "raw_image_path" -> source RGB image
+#     "depth_path"     -> pre-computed depth PNG (run pre_depth_calculations.py first)
+#     "prompt"         -> text caption for this image
+data:
+  batch_size: 4                       # per-GPU batch; 4 is the 12 GB-safe max with checkpointing
+  # batch_size: 2                     # lower to 2 (then 1) if you hit OOM
+  val_batch_size: 4                   # val uses no_grad — 4 is safe and gives 4× more val coverage
+  workers: 4
+  val_workers: 2
+
+  # resize_mode: letterbox  (active — SquarePad prepended to transform list in local_depth.yaml)
+  json_file:     data/depth_training/train.json   # built by pre_depth_calculations.py (has depth_path)
+  val_json_file: data/depth_training/val.json
+
+# =============================================================================
+# 3. GLOBAL FALLBACK PROMPT
+# =============================================================================
+# prompt: null      -> each image uses its own "prompt" field from the JSON
+# prompt: "a photo" -> overrides ALL per-image prompts with this single string
+use_empty_prompt_eval: false
+prompt: null
+
+# =============================================================================
+# 4. OPERATIONAL SETTINGS
+# =============================================================================
+seed: 42
+# val/loss is averaged over val_batches × val_batch_size = 64 × 4 = 256 images
+# from the 4,000-image val set (~6 % per check). Cheap enough to run at every
+# val_steps; representative enough to track true generalisation.
+val_batches: 64                  # batches of val_batch_size images to average for val/loss
+n_samples: 1                     # (unused by training; inference only)
+save_grid: true                  # (unused by training; kept for compatibility)
+
+# Checkpoint-monitoring images (references.md §8): every saved checkpoint writes
+# N validation images (each a labeled ORIGINAL | DEPTH MAP | PREDICTED file) into
+# that checkpoint's own folder, so you can judge it by eye. The N scenes split
+# 50/50: half FIXED (same every checkpoint -> watch them improve), half
+# re-RANDOMIZED each checkpoint (fresh generalization peek). Depth training
+# generates WITH the prompt only (no empty-prompt image).
+n_grid_images: 10                # number of validation images per checkpoint (5 fixed + 5 fresh)
+grid_include_empty_prompt: false # OFF for depth training (generate WITH prompt only).
+                                 # true -> also add a 4th "RAW DEPTH GEN" panel (empty-prompt gen).
+
+# =============================================================================
+# 5. HARDWARE PRECISION
+# =============================================================================
+bf16: true                            # 16-bit brain float — halves VRAM vs fp32
+ignore_check: true
+log_cond: true
+tag: depth
+
+# =============================================================================
+# 6. MODEL OVERRIDES (base diffusion model)
+# =============================================================================
+model:
+  _target_: src.model.SD15
+  pipeline_type: diffusers.StableDiffusionPipeline
+  model_name: ${base_model_name}   # default shown here; train_depth.py overrides to base_model_path when local_files_only=true
+  local_files_only: ${local_files_only}
+  guidance_scale: 7.5
+
+# =============================================================================
+# 7. LORA ARCHITECTURE SETTINGS
+# =============================================================================
+lora:
+  struct:
+    optimize: true
+    cfg: false
+    ckpt_path: null                   # Set to resume, e.g. "outputs/.../checkpoint-3000"
+    encoder:
+      _target_: src.annotators.midas.DepthEstimator
+      model: ${depth_model_name}   # default shown here; train_depth.py overrides to depth_model_path when local_files_only=true
+      size: ${size}
+      local_files_only: ${local_files_only}
+    config:
+      adaption_mode: only_res_conv
+      rank: 128
+      c_dim: 128
+      lora_scale: 1

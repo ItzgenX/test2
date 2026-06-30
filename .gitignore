@@ -1,0 +1,13 @@
+.DS_Store
+outputs/
+checkpoints/
+*.pyc
+ignore
+.vscode/
+
+
+*__pycache__/
+
+/data/
+
+docs_word/

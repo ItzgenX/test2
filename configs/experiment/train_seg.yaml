@@ -1,0 +1,152 @@
+# @package _global_
+#
+# configs/experiment/train_seg.yaml
+# -----------------------------------
+# Unified segmentation experiment config — ONE config for any GPU setup.
+# Supersedes train_seg_12gb.yaml and train_seg_cluster.yaml (cluster not needed).
+# This is the direct segmentation twin of configs/experiment/train_depth.yaml.
+# The ONLY differences from depth are flagged inline with "DIFF:".
+
+defaults:
+  - /lora@lora.struct: struct
+  - override /lora/encoder@lora.struct.encoder: segformer   # DIFF: SegFormer-b5 (was midas)
+  - override /model: sd15
+  - override /data: local_seg                                # DIFF: seg data module (was local_depth)
+  - _self_
+
+# =============================================================================
+# MODEL LOADING — LOCAL vs INTERNET  (one switch: local_files_only)
+# =============================================================================
+# Both the local folder AND the hub id are listed below; the flag picks which.
+#   local_files_only: true  -> use LOCAL folders (*_model_path). Fully offline.
+#   local_files_only: false -> use HUB ids (*_model_name); downloads if missing.
+# The choice is made in train_seg.py (sets model.model_name / encoder.model).
+# Local paths are relative to the repo root; the code makes them absolute.
+local_files_only: true
+
+base_model_name:  runwayml/stable-diffusion-v1-5
+base_model_path:  checkpoints/local_models/stable-diffusion-v1-5
+
+# DIFF: SegFormer b5 (was dpt-hybrid-midas).
+# LOCKED: b5 for best seg map quality — references.md §9.
+seg_model_name: nvidia/segformer-b5-finetuned-cityscapes-1024-1024
+seg_model_path: checkpoints/local_models/segformer-b5-cityscapes
+
+# =============================================================================
+# HARDWARE  —  12 GB GPU (single card, same as depth)
+# =============================================================================
+#   Effective batch = batch_size(4) x grad_accum(4) = 16 (matches depth exactly)
+#   For cluster: add  accelerate launch --num_processes=N  to the launch command.
+#   Per-GPU settings stay the same — only the effective batch and wall-clock change.
+#
+gradient_checkpointing: true           # REQUIRED on 12 GB (saves ~1.5 GB VRAM)
+gradient_accumulation_steps: 4        # 4 bsz x 4 accum = 16 effective batch
+size: 512                              # square canvas; must match SD1.5 native resolution
+
+# =============================================================================
+# 1. GENERAL TRAINING PARAMETERS  (identical to depth — required for valid comparison)
+# =============================================================================
+#
+# ── DATASET MATH (60K train / 4K val / 4K test) ──────────────────────────────
+#   effective batch 16 -> 60,000 / 16 = 3,750 optimizer steps / epoch
+#   val_steps  = 500  ->  7-8 val/loss checks per epoch  (cheap: no_grad + few batches)
+#   ckpt_steps = 1000 ->  3-4 step-level checkpoint saves per epoch (heavy: weights + images)
+#
+learning_rate: 1.0e-4
+lr_warmup_steps: 500               # ~13 % of epoch 1 (500 / 3750 steps)
+lr_scheduler: cosine               # decays 1e-4 -> ~0 over the full run
+
+epochs: 5                          # 5 x 3,750 = 18,750 optimizer steps
+
+# ── DECOUPLED val/checkpoint triggers ──────────────────────────────────────────
+# val_steps  : compute val/loss (+ update best_model/ if improved). CHEAP.
+# ckpt_steps : write weights + N monitoring images to disk. HEAVY.
+# These are INDEPENDENT — validate every 500 but only save disk every 1000.
+val_steps:  500
+ckpt_steps: 1000
+
+# =============================================================================
+# 2. DATA  (DIFF: seg manifests + seg data module; all other settings identical)
+# =============================================================================
+#   JSON keys read by SegJsonDataset (src/data/local_seg.py):
+#     "raw_image_path" -> source RGB image
+#     "seg_path"       -> pre-computed class-ID PNG (run calculate_segmentation_map.py)
+#     "prompt"         -> text caption
+data:
+  batch_size:     4         # per-GPU max for 12 GB with gradient_checkpointing
+  val_batch_size: 4         # val uses no_grad — 4 is safe, gives 4x more coverage
+  workers:        4
+  val_workers:    2
+  # DIFF: seg_training/ (was depth_training/).
+  # Built by: python calculate_segmentation_map.py --data_dir data/
+  json_file:     data/seg_training/train.json
+  val_json_file: data/seg_training/val.json   # NEVER test.json here (references.md §8)
+
+# =============================================================================
+# 3. GLOBAL FALLBACK PROMPT  (identical to depth)
+# =============================================================================
+use_empty_prompt_eval: false
+prompt: null    # null -> each image uses its own "prompt" field from the JSON
+
+# =============================================================================
+# 4. OPERATIONAL SETTINGS  (identical to depth, except seg grid knobs and tag)
+# =============================================================================
+seed: 42
+val_batches: 64        # val/loss averaged over 64 x 4 = 256 val images (~6% of 4K set)
+n_samples: 1           # (inference only — unused during training)
+save_grid: true        # (kept for compatibility with base config)
+
+# ── Checkpoint-monitoring images ─────────────────────────────────────────────
+# Every checkpoint writes N labeled validation images into its own folder
+# (ORIGINAL | SEG MAP | PREDICTED), split 50/50 fixed/fresh:
+#   fixed half: same scenes every checkpoint -> watch them improve over training.
+#   fresh half: re-randomized -> generalization peek on unseen scenes.
+# Source = validation set only (never train/test).
+n_grid_images: 10                # 10 val scenes per checkpoint (5 fixed + 5 fresh)
+grid_include_empty_prompt: false # OFF -> generate WITH prompt only (matches depth)
+                                 # true -> also add a 4th "RAW SEG GEN" panel (empty-prompt gen)
+
+# =============================================================================
+# 5. PRECISION  (identical to depth)
+# =============================================================================
+bf16: true
+ignore_check: true
+log_cond: true
+tag: seg                          # DIFF: "seg" (was "depth") -> outputs/train/seg/...
+
+# =============================================================================
+# 6. MODEL OVERRIDES  (identical to depth)
+# =============================================================================
+model:
+  _target_: src.model.SD15
+  pipeline_type: diffusers.StableDiffusionPipeline
+  model_name: ${base_model_name}   # train_seg.py overrides to base_model_path when local
+  local_files_only: ${local_files_only}
+  guidance_scale: 7.5
+
+# =============================================================================
+# 7. LORA ARCHITECTURE  (rank/c_dim/adaption_mode IDENTICAL to depth: 128/128/only_res_conv)
+# =============================================================================
+lora:
+  struct:
+    optimize: true
+    cfg: false
+    ckpt_path: null                # set to resume, e.g. "outputs/train/seg/runs/.../step1000"
+    encoder:                       # DIFF: SegmentationEncoder (was DepthEstimator)
+      _target_: src.encoders.seg_encoder.SegmentationEncoder
+      model: ${seg_model_name}     # train_seg.py overrides to seg_model_path when local
+      size: ${size}
+      local_files_only: ${local_files_only}
+    config:
+      adaption_mode: only_res_conv
+      rank: 128
+      c_dim: 128
+      lora_scale: 1
+
+# LAUNCH COMMANDS:
+#   Single 12 GB GPU:
+#     python train_seg.py experiment=train_seg
+#
+#   Multi-GPU (if needed later):
+#     accelerate launch --num_processes=N train_seg.py experiment=train_seg
+#     # With N GPUs, effective batch = 4 x 4 x N. Consider scaling LR by sqrt(N).

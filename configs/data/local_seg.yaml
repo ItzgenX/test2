@@ -1,0 +1,27 @@
+_target_: src.data.local_seg.SegJsonDataModule
+
+# Stage D data module. Twin of local_depth.yaml — same RGB transform chain; the
+# segmentation map is loaded + colourised INSIDE SegJsonDataset (raw-ID PNG ->
+# NEAREST resize -> Cityscapes palette), so no seg-specific transform appears here.
+json_file:     ???
+val_json_file: null
+size: ${size}
+batch_size: 4
+val_batch_size: 4       # 4 is safe under no_grad; matches depth default (was 1)
+workers: 4
+val_workers: 2
+
+# resize_mode: letterbox — SquarePad pads the shorter side (edge-replicated) before
+# Resize, keeping the full driving-scene frame. This RGB chain mirrors the SHARED
+# build_seg_square_preprocess() used by calculate_segmentation_map.py and inference_seg.py
+# (resize_mode="letterbox"); keep them consistent so train RGB and live inference match.
+transform:
+  - _target_: src.data.transforms.SquarePad      # pad shorter side -> square (edge-replicated)
+  - _target_: torchvision.transforms.Resize
+    size:
+      - ${size}
+      - ${size}
+  - _target_: torchvision.transforms.ToTensor     # [0,255] -> [0,1]
+  - _target_: torchvision.transforms.Normalize    # [0,1] -> [-1,1]
+    mean: [0.5, 0.5, 0.5]
+    std:  [0.5, 0.5, 0.5]

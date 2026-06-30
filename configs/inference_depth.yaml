@@ -1,0 +1,103 @@
+# configs/inference_depth.yaml
+# ----------------------------
+# Base config for inference_depth.py.
+#
+# Loads a trained depth-conditioned LoRAdapter checkpoint and generates images
+# conditioned on the depth structure of input images.
+#
+# USAGE — from a JSON manifest (recommended):
+#   python inference_depth.py \
+#       ckpt_path=outputs/train/runs/YYYY-MM-DD/HH-MM-SS/checkpoint-3000 \
+#       inference.json_file=dataset.json \
+#       inference.output_dir=results
+#
+# USAGE — single image:
+#   python inference_depth.py \
+#       ckpt_path=outputs/train/runs/YYYY-MM-DD/HH-MM-SS/checkpoint-3000 \
+#       "inference.images=[data/cat.jpg]" \
+#       "inference.prompts=['a realistic photo of a cat sitting on a chair']" \
+#       inference.output_dir=results
+#
+# OUTPUT (per input image):
+#   results/
+#       cat_grid.jpg             ← 4-panel: ORIGINAL | DEPTH MAP | PREDICTED | RAW DEPTH GEN
+#       cat_original.jpg
+#       cat_depth.jpg
+#       cat_predicted.jpg
+#       cat_raw_depth_gen.jpg    ← same depth, empty prompt (pure depth adherence)
+#
+# HOW IT WORKS:
+#   - The DepthEstimator (midas encoder) runs automatically inside model.sample().
+#   - skip_encode is NOT set → DPT converts the input image to a depth map,
+#     which is fed through the mapper into the LoRA layers.
+#   - You do NOT need pre-computed depth maps at inference time.
+
+defaults:
+  - model: sd15
+  - lora@lora.struct: struct
+  - override /lora/encoder@lora.struct.encoder: midas
+  - _self_
+
+# ---- Checkpoint -----------------------------------------------------------
+# Path to the checkpoint directory produced by train_depth.py.
+# Structure expected:  <ckpt_path>/struct/lora-checkpoint.pt
+#                      <ckpt_path>/struct/mapper-checkpoint.pt
+ckpt_path: ???     # e.g. outputs/train/runs/2024-01-01/00-00-00/checkpoint-3000
+
+# ---- Global resolution (must match training) ------------------------------
+size: 512          # square canvas; must match what training/calc used
+seed: 42
+
+# =============================================================================
+# MODEL LOADING — LOCAL vs INTERNET  (one switch: local_files_only)
+# =============================================================================
+# MUST match how the model was set during training so inference uses the same
+# base + depth model (references.md §3 parity rule).
+# Both the local folder AND the hub id are listed; the flag picks which.
+#   local_files_only: true   -> use LOCAL folders (*_model_path), offline.
+#   local_files_only: false  -> use HUB ids (*_model_name); download if missing.
+# The choice is made in inference_depth.py (reads this flag, sets model.model_name
+# / encoder.model before the model is built). Local paths are relative to the repo
+# root; the code makes them absolute.
+local_files_only: true
+
+base_model_name:  runwayml/stable-diffusion-v1-5
+base_model_path:  checkpoints/local_models/stable-diffusion-v1-5
+depth_model_name: Intel/dpt-hybrid-midas
+depth_model_path: checkpoints/local_models/dpt-hybrid-midas
+
+# ---- Base diffusion model -------------------------------------------------
+model:
+  model_name: ${base_model_name}   # default; inference_depth.py overrides to base_model_path when local_files_only=true
+
+# ---- LoRA (inference mode — weights not updated) --------------------------
+lora:
+  struct:
+    optimize: false   # frozen at inference
+    encoder:
+      # LIVE depth encoder used at inference — same model the training maps were
+      # computed with (references.md §3 parity rule).
+      model: ${depth_model_name}   # default; inference_depth.py overrides to depth_model_path when local_files_only=true
+
+# ---- Inference parameters -------------------------------------------------
+inference:
+  # Input — choose ONE:
+  images:    []         # list of image paths, e.g. ["data/cat.jpg", "data/dog.jpg"]
+  json_file: null       # OR path to JSON manifest with "image" and "prompt" per entry
+
+  prompts:   []         # prompts for 'images' list mode; leave empty to use JSON prompts
+
+  # Output:
+  output_dir: results          # directory where output images are saved
+  save_generated_only: false   # true → save only predicted image, mirroring JSON folder structure
+
+  # Generation:
+  n_samples:           1    # number of generated images per input image
+  num_inference_steps: 50   # diffusion denoising steps (more = slower but sharper)
+  guidance_scale:      7.5  # CFG scale (higher = follows prompt more strictly)
+
+hydra:
+  run:
+    dir: outputs/inference/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

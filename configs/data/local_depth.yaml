@@ -1,0 +1,25 @@
+_target_: src.data.local.DepthJsonDataModule
+
+json_file:     ???
+val_json_file: null
+size: ${size}
+batch_size: 4
+val_batch_size: 1
+workers: 4
+val_workers: 2
+
+# resize_mode: letterbox  (SquarePad pads the shorter side with edge-replication
+#                          before Resize — keeps full frame content, no forced crop)
+# PARITY-CRITICAL: this chain must stay identical to the inline `preprocess`
+# in pre_depth_calculations.py and inference_depth.py. If you edit one, edit all
+# three — otherwise training RGB, saved depth, and live inference diverge.
+transform:
+  - _target_: src.data.transforms.SquarePad    # pad shorter side → square (edge-replicated)
+  - _target_: torchvision.transforms.Resize
+    size:
+      - ${size}
+      - ${size}
+  - _target_: torchvision.transforms.ToTensor
+  - _target_: torchvision.transforms.Normalize
+    mean: [0.5, 0.5, 0.5]
+    std:  [0.5, 0.5, 0.5]

@@ -1,0 +1,48 @@
+defaults:
+  - data: ???
+  - model: ???
+  - _self_
+  - experiment: null
+
+size: ???
+
+gradient_checkpointing: false
+gradient_accumulation_steps: 1
+
+learning_rate: 1e-4
+lr_warmup_steps: 0
+lr_scheduler: constant
+
+epochs: 10
+val_steps: 1000
+ckpt_steps: 1000
+
+prompt: null
+use_empty_prompt_eval: false
+
+n_samples: 1
+seed: 42
+val_batches: 4
+save_grid: true
+
+# Segmentation-specific monitoring knobs (resolved by train_seg.py via cfg.get()).
+# Set here as base defaults; the experiment yaml overrides with the real values.
+# n_grid_images          : N val scenes per checkpoint (split 50/50 fixed/fresh).
+# grid_include_empty_prompt: also render the 4th "RAW SEG GEN" (empty-prompt) panel.
+n_grid_images: 10
+grid_include_empty_prompt: false
+
+bf16: false
+ignore_check: false
+log_cond: false
+tag: ''
+local_files_only: true
+
+hydra:
+  run:
+    dir: outputs/train/${tag}/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: outputs/train/${tag}/multiruns/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: true
