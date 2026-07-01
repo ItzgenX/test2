@@ -72,20 +72,21 @@ def parse_bool(value):
 #  HELPER: read image path from a JSON entry regardless of which key it uses   #
 # ============================================================================ #
 
-def _get_source_key(entry: dict) -> str:
+def _get_source_key(entry: dict, source_key: str = "source") -> str:
     """
-    Return the image path string from a JSON entry.
+    Return the image path string from a JSONL entry.
 
-    Existing data/train.json uses 'source'; DepthJsonDataset expects
-    'raw_image_path'.  This single helper is the only place that knows
-    about both names, so the rest of the code never has to guess.
+    Checks `source_key` first (default "source", override with --source_key).
+    Falls back to "raw_image_path" so depth_training/ JSONLs also work.
+    Change the key your manifests use without touching any other code:
+        python depth_map_calculations.py --data_dir data/ --source_key target
     """
-    if "source" in entry:
-        return entry["source"]
+    if source_key in entry:
+        return entry[source_key]
     if "raw_image_path" in entry:
         return entry["raw_image_path"]
     raise KeyError(
-        f"Entry has neither 'source' nor 'raw_image_path' key. "
+        f"Entry has neither '{source_key}' nor 'raw_image_path' key. "
         f"Keys present: {list(entry.keys())}"
     )
 
@@ -310,6 +311,7 @@ def build_depth_training_jsons(
     skip_existing: bool = True,
     subset_n: int = None,
     local_files_only: bool = False,
+    source_key: str = "source",
 ) -> None:
     """
     Create depth_training/{train,val,test}.jsonl from data/{train,val,test}.jsonl.
@@ -372,7 +374,7 @@ def build_depth_training_jsons(
         # correctness guarantee for the zip() in step 3.
         abs_image_paths = []
         for entry in entries:
-            raw_str = _get_source_key(entry)
+            raw_str = _get_source_key(entry, source_key)
             p = Path(raw_str)
             abs_p = p if p.is_absolute() else cwd / p
             abs_image_paths.append(abs_p)
@@ -410,7 +412,7 @@ def build_depth_training_jsons(
                 continue
 
             # Normalize to forward-slash, relative to cwd
-            raw_rel = Path(_get_source_key(entry)).as_posix()
+            raw_rel = Path(_get_source_key(entry, source_key)).as_posix()
             try:
                 depth_rel = Path(depth_abs_str).relative_to(cwd).as_posix()
             except ValueError:
@@ -716,6 +718,11 @@ def main():
                         help="Device: 'cuda' or 'cpu'. Default: cuda if available")
     parser.add_argument("--no_skip", action="store_true",
                         help="Re-compute even if depth PNG already exists.")
+    parser.add_argument("--source_key", type=str, default="source",
+                        help="Key in your input JSONLs that holds the image path. "
+                             "Default: 'source'. Change to 'target' (or any other key) "
+                             "if your manifests use a different name. "
+                             "Example: --source_key target")
 
     args = parser.parse_args()
 
@@ -764,6 +771,7 @@ def main():
             skip_existing=not args.no_skip,
             subset_n=args.dry_run_n,
             local_files_only=args.local_files_only,
+            source_key=args.source_key,
         )
 
     elif args.json_file and not args.input_dir:

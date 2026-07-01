@@ -84,20 +84,21 @@ def parse_bool(value):
 #  HELPERS (mirrors depth_map_calculations.py — adapted, not copy-pasted)      #
 # ============================================================================ #
 
-def _get_source_key(entry: dict) -> str:
+def _get_source_key(entry: dict, source_key: str = "source") -> str:
     """
-    Return the source image path from a JSON entry, tolerating either key name.
+    Return the source image path from a JSONL entry.
 
-    Existing data/*.json use 'source'; the seg-training JSONs we WRITE use
-    'raw_image_path'. This one helper is the only place that knows both names.
-    Fails loudly if neither key is present.
+    Checks `source_key` first (default "source", override with --source_key).
+    Falls back to "raw_image_path" so seg_training/ JSONLs also work.
+    Change the key your manifests use without touching any other code:
+        python seg_map_calculations.py --data_dir data/ --source_key target
     """
-    if "source" in entry:
-        return entry["source"]
+    if source_key in entry:
+        return entry[source_key]
     if "raw_image_path" in entry:
         return entry["raw_image_path"]
     raise KeyError(
-        f"Entry has neither 'source' nor 'raw_image_path'. Keys: {list(entry.keys())}"
+        f"Entry has neither '{source_key}' nor 'raw_image_path'. Keys: {list(entry.keys())}"
     )
 
 
@@ -341,6 +342,7 @@ def build_segmentation_training_jsons(
     skip_existing: bool = True,
     subset_n: int = None,
     local_files_only: bool = True,
+    source_key: str = "source",
 ) -> None:
     """
     Build data/seg_training/{train,val,test}.jsonl from data/{train,val,test}.jsonl.
@@ -392,7 +394,7 @@ def build_segmentation_training_jsons(
         # Index i in entries <-> index i in abs_image_paths — never re-sorted.
         abs_image_paths = []
         for entry in entries:
-            p     = Path(_get_source_key(entry))
+            p     = Path(_get_source_key(entry, source_key))
             abs_p = p if p.is_absolute() else cwd / p
             abs_image_paths.append(abs_p)
             if not abs_p.exists():
@@ -424,7 +426,7 @@ def build_segmentation_training_jsons(
                 n_skipped += 1
                 continue
 
-            raw_rel = Path(_get_source_key(entry)).as_posix()
+            raw_rel = Path(_get_source_key(entry, source_key)).as_posix()
             try:
                 seg_rel = Path(seg_abs_str).relative_to(cwd).as_posix()
             except ValueError:
@@ -560,6 +562,13 @@ def main():
         "--no_skip", action="store_true",
         help="Re-compute even if a seg PNG already exists.",
     )
+    parser.add_argument(
+        "--source_key", type=str, default="source",
+        help="Key in your input JSONLs that holds the image path. "
+             "Default: 'source'. Change to 'target' (or any other key) "
+             "if your manifests use a different name. "
+             "Example: --source_key target",
+    )
     args = parser.parse_args()
 
     if not args.data_dir and not args.input_dir:
@@ -596,6 +605,7 @@ def main():
             device=args.device, resize_mode=args.resize_mode,
             skip_existing=not args.no_skip, subset_n=args.dry_run_n,
             local_files_only=args.local_files_only,
+            source_key=args.source_key,
         )
     else:
         run_seg_directory_mode(args)
