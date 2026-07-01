@@ -40,6 +40,8 @@ QUICK COMMANDS (run from repo root with conda loradapter env active):
 
   # --- Re-compute everything (force overwrite of existing PNGs) ---
   python depth_map_calculations.py --data_dir data/ --no_skip
+
+  ###python depth_map_calculations.py --dataset_dir D:/MyWorkplace/WorkStation/custome_dataset --data_dir data/ --image_path target
 """
 
 import argparse
@@ -72,21 +74,21 @@ def parse_bool(value):
 #  HELPER: read image path from a JSON entry regardless of which key it uses   #
 # ============================================================================ #
 
-def _get_source_key(entry: dict, source_key: str = "source") -> str:
+def _get_image_path(entry: dict, image_path: str = "source") -> str:
     """
     Return the image path string from a JSONL entry.
 
-    Checks `source_key` first (default "source", override with --source_key).
+    Checks `image_path` first (default "source", override with --image_path).
     Falls back to "raw_image_path" so depth_training/ JSONLs also work.
     Change the key your manifests use without touching any other code:
-        python depth_map_calculations.py --data_dir data/ --source_key target
+        python depth_map_calculations.py --data_dir data/ --image_path target
     """
-    if source_key in entry:
-        return entry[source_key]
+    if image_path in entry:
+        return entry[image_path]
     if "raw_image_path" in entry:
         return entry["raw_image_path"]
     raise KeyError(
-        f"Entry has neither '{source_key}' nor 'raw_image_path' key. "
+        f"Entry has neither '{image_path}' nor 'raw_image_path' key. "
         f"Keys present: {list(entry.keys())}"
     )
 
@@ -120,6 +122,7 @@ def precompute_depths_from_paths(
     skip_existing: bool = True,
     input_dir: Path = None,
     local_files_only: bool = False,
+    out_path_fn=None,
 ) -> dict:
     """
     Core function: compute depth maps for a list of image paths, save as grayscale PNGs.
@@ -129,11 +132,19 @@ def precompute_depths_from_paths(
     local_files_only: True = load the depth model strictly from local disk (offline,
                no network); pass a local folder path as `model_name` for this.
                False = allow downloading the model (into checkpoints/local_models).
+    out_path_fn: optional callable(image_path: Path) -> Path. When given, it FULLY
+               decides where each depth PNG is saved (overrides output_dir/input_dir
+               logic). Used by dataset-scan mode to save the map IN the image's own
+               folder as <folder>_depth_map.png. When None, the default
+               _depth_out_path(output_dir, input_dir) placement is used.
 
     Returns:
         dict mapping original image path → saved depth PNG path
         (only includes entries that were actually processed)
     """
+    # One place decides the output path for an image, honouring out_path_fn.
+    def _resolve_out(p):
+        return out_path_fn(Path(p)) if out_path_fn is not None else _depth_out_path(p, output_dir, input_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Load DPT model -------------------------------------------------- #
@@ -174,7 +185,7 @@ def precompute_depths_from_paths(
 
         to_process = []
         for p in batch_paths:
-            out = _depth_out_path(p, output_dir, input_dir)
+            out = _resolve_out(p)
             if skip_existing and out.exists():
                 path_to_depth[str(p)] = str(out)
                 skipped += 1
@@ -186,12 +197,37 @@ def precompute_depths_from_paths(
 
         tensors, valid_paths = [], []
         for p in to_process:
+            # Split into two try/except blocks so a failure tells us WHICH step
+            # broke: loading the file (Pillow) vs. preprocessing it (SquarePad/
+            # Resize/ToTensor/Normalize). The old single try block blamed every
+            # failure on "could not load image" even when the real failure was
+            # in preprocess() — misleading when the file is perfectly valid.
             try:
                 img = Image.open(p).convert("RGB")
+            except Exception as e:
+                p_obj = Path(p)
+                exists = p_obj.exists()
+                print(f"\n[WARN] Image LOAD failed (Pillow could not open/decode the file) — tried:\n"
+                      f"         {p}\n"
+                      f"         reason: {e}\n"
+                      f"         path.exists() = {exists}"
+                      + ("" if exists else "  -> the path itself is wrong (case, mount point, or "
+                         "missing --image_root — depending on which mode you're running)")
+                      + (f"\n         file size = {p_obj.stat().st_size} bytes"
+                         "  -> 0 bytes or a tiny file usually means a broken symlink or failed copy"
+                         if exists else ""))
+                errors += 1
+                continue
+
+            try:
                 tensors.append(preprocess(img))     # [3, H, W] in [-1, 1]
                 valid_paths.append(p)
             except Exception as e:
-                print(f"\n[WARN] Could not load {Path(p).name}: {e}")
+                print(f"\n[WARN] Image PREPROCESS failed (SquarePad/Resize/ToTensor/Normalize) "
+                      f"— the file loaded fine, the transform chain threw — path:\n"
+                      f"         {p}\n"
+                      f"         image size/mode: {img.size} {img.mode}\n"
+                      f"         reason: {e}")
                 errors += 1
 
         if not tensors:
@@ -206,7 +242,7 @@ def precompute_depths_from_paths(
             depth_single = depth_maps[i, 0]    # [H, W] in [0, 1]
             depth_np = (depth_single.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
 
-            out = _depth_out_path(src_path, output_dir, input_dir)
+            out = _resolve_out(src_path)
             out.parent.mkdir(parents=True, exist_ok=True)
             Image.fromarray(depth_np, mode="L").save(out)   # "L" = 8-bit grayscale
 
@@ -311,13 +347,14 @@ def build_depth_training_jsons(
     skip_existing: bool = True,
     subset_n: int = None,
     local_files_only: bool = False,
-    source_key: str = "source",
+    image_path: str = "source",
+    image_root: Path = None,
 ) -> None:
     """
     Create depth_training/{train,val,test}.jsonl from data/{train,val,test}.jsonl.
 
     For each source JSONL this function:
-      1. Reads every entry's image path + prompt via _get_source_key() —
+      1. Reads every entry's image path + prompt via _get_image_path() —
          handles both the 'source' key (existing data/ JSONLs) and the
          'raw_image_path' key (DepthJsonDataset format).
       2. Runs precompute_depths_from_paths() to compute (or look up cached)
@@ -369,14 +406,16 @@ def build_depth_training_jsons(
         print(f"{'='*56}")
 
         # ---- Step 1: resolve absolute image paths in entry order ----------- #
-        # Built in LOCKSTEP with `entries` (index i in entries <-> index i here).
-        # Never re-sorted or re-indexed — the parallel structure is the
-        # correctness guarantee for the zip() in step 3.
+        # Priority: image_root / relative_path  >  cwd / relative_path
+        # If --image_root /mnt/data is given and JSONL says "images/foo.jpg",
+        # the actual path becomes /mnt/data/images/foo.jpg.
+        # Without --image_root, falls back to resolving relative to CWD as before.
+        _root = image_root if image_root is not None else cwd
         abs_image_paths = []
         for entry in entries:
-            raw_str = _get_source_key(entry, source_key)
+            raw_str = _get_image_path(entry, image_path)
             p = Path(raw_str)
-            abs_p = p if p.is_absolute() else cwd / p
+            abs_p = p if p.is_absolute() else _root / p
             abs_image_paths.append(abs_p)
             if not abs_p.exists():
                 print(f"  [WARN] Image not found on disk: {abs_p}")
@@ -407,12 +446,12 @@ def build_depth_training_jsons(
             depth_abs_str = path_to_depth.get(str(abs_img_p))
 
             if depth_abs_str is None:
-                print(f"  [WARN] No depth result for {abs_img_p.name} — entry skipped.")
+                print(f"  [WARN] No depth result for {abs_img_p} — entry skipped.")
                 n_skipped += 1
                 continue
 
             # Normalize to forward-slash, relative to cwd
-            raw_rel = Path(_get_source_key(entry, source_key)).as_posix()
+            raw_rel = Path(_get_image_path(entry, image_path)).as_posix()
             try:
                 depth_rel = Path(depth_abs_str).relative_to(cwd).as_posix()
             except ValueError:
@@ -437,6 +476,209 @@ def build_depth_training_jsons(
 
         # ---- Step 5: verify every entry ------------------------------------ #
         _verify_depth_training_jsonl(out_path)
+
+
+# ============================================================================ #
+#  DATASET-SCAN MODE                                                           #
+#  Find raw_image.jpg by SCANNING a dataset folder (not by trusting JSONL      #
+#  paths); save each depth map into a SIBLING folder                          #
+#  (<dataset_dir>_depth_map/) that MIRRORS the internal folder structure,      #
+#  named after the leaf folder; then rebuild the split manifests from the     #
+#  originals so every prompt + split assignment stays exactly mapped.         #
+# ============================================================================ #
+
+def _sibling_map_path(
+    image_path: Path, dataset_dir: Path, sibling_root: Path,
+    suffix: str, ext: str = ".png",
+) -> Path:
+    """
+    Given an image at    <dataset_dir>/000417/raw_image.jpg
+    and sibling_root  =  <dataset_dir's parent>/<dataset_dir.name><suffix>
+                         (e.g. .../custome_dataset_depth_map)
+    return the map path  <sibling_root>/000417/000417<suffix><ext>
+
+    The output tree MIRRORS dataset_dir's internal structure (any nesting
+    depth), living as a SIBLING of dataset_dir — the original dataset folder
+    is never written into. The map filename is still based on the leaf folder
+    name (not the fixed "raw_image" filename) so it stays unique and readable.
+    """
+    rel_dir     = image_path.parent.relative_to(dataset_dir)  # e.g. "000417" or "A/000417"
+    folder_name = image_path.parent.name                      # e.g. "000417"
+    return sibling_root / rel_dir / (folder_name + suffix + ext)
+
+
+def _verify_scan_training_jsonl(jsonl_path: Path, map_key: str, suffix: str) -> tuple[int, int]:
+    """
+    Verify a scan-mode output JSONL. For each entry checks:
+      1. Required keys present: raw_image_path, <map_key>, prompt.
+      2. The map file exists on disk.
+      3. The map lives in a SIBLING tree, NOT inside the image's own folder
+         (the source dataset folder must never be written into).
+      4. The map's leaf folder name matches the image's leaf folder name
+         (mirrored structure) and the map is named <folder_name><suffix>.png.
+    Returns (n_passed, n_failed) and prints a one-line PASS/FAIL summary.
+    """
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
+
+    passed = failed = 0
+    for i, entry in enumerate(entries):
+        missing = [k for k in ("raw_image_path", map_key, "prompt") if k not in entry]
+        if missing:
+            print(f"  [FAIL] entry {i}: missing keys {missing}")
+            failed += 1
+            continue
+
+        raw_p = Path(entry["raw_image_path"])
+        map_p = Path(entry[map_key])
+
+        if not map_p.exists():
+            print(f"  [FAIL] entry {i}: map file not on disk: {map_p}")
+            failed += 1
+            continue
+
+        if map_p.parent == raw_p.parent:
+            print(f"  [FAIL] entry {i}: map was written INTO the source dataset "
+                  f"folder (expected a sibling tree): {map_p.parent}")
+            failed += 1
+            continue
+
+        if map_p.parent.name != raw_p.parent.name:
+            print(f"  [FAIL] entry {i}: mirrored leaf folder name mismatch — "
+                  f"image={raw_p.parent.name!r}  map={map_p.parent.name!r}")
+            failed += 1
+            continue
+
+        expected = raw_p.parent.name + suffix + ".png"
+        if map_p.name != expected:
+            print(f"  [FAIL] entry {i}: map name {map_p.name!r} != expected {expected!r}")
+            failed += 1
+            continue
+
+        passed += 1
+
+    status = "PASS" if failed == 0 else "FAIL"
+    print(f"  [{status}] {jsonl_path.name}: {passed}/{len(entries)} entries valid"
+          + (f", {failed} FAILED" if failed else ""))
+    return passed, failed
+
+
+def build_depth_training_from_scan(
+    dataset_dir: Path,
+    data_dir: Path,
+    output_dir: Path,
+    image_name: str = "raw_image.jpg",
+    image_path: str = "target",
+    size: int = 512,
+    batch_size: int = 4,
+    model_name: str = "Intel/dpt-hybrid-midas",
+    device: str = "cuda",
+    skip_existing: bool = True,
+    local_files_only: bool = False,
+    subset_n: int = None,
+) -> None:
+    """
+    DATASET-SCAN MODE (Stage A, robust variant).
+
+    1. SCAN dataset_dir recursively for files named exactly `image_name`
+       (default 'raw_image.jpg'). Every OTHER file is ignored, so the source
+       dataset can freely contain other images per folder.
+    2. Compute a depth map for each found image and save it into a SIBLING
+       folder that MIRRORS dataset_dir's internal structure — the source
+       dataset folder itself is NEVER written into:
+           dataset_dir      = .../custome_dataset
+           sibling_root      = .../custome_dataset_depth_map
+           .../custome_dataset/000417/raw_image.jpg
+             -> .../custome_dataset_depth_map/000417/000417_depth_map.png
+    3. Read the original split manifests (train/val/test .jsonl) in data_dir to
+       recover each image's PROMPT and which SPLIT it belongs to, matching by
+       ABSOLUTE image path (case-normalised) — so the prompt<->image<->split
+       mapping is preserved exactly.
+    4. Write data/depth_training/{train,val,test}.jsonl with ABSOLUTE
+       raw_image_path + depth_path + prompt. Verify each file.
+
+    Why scan instead of trusting JSONL paths to FIND images: if raw_image.jpg
+    exists on disk it WILL be found, regardless of how the JSONL path was
+    written. The JSONL is used only to attach prompt + split, matched by path.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sibling output tree: a NEW folder next to dataset_dir, same name + suffix.
+    # e.g. .../custome_dataset  ->  .../custome_dataset_depth_map
+    sibling_root = dataset_dir.parent / (dataset_dir.name + "_depth_map")
+    sibling_root.mkdir(parents=True, exist_ok=True)
+    print(f"Depth maps will be saved to (sibling, mirrored structure): {sibling_root}")
+
+    # ---- Step 1: SCAN for the target filename only ------------------------- #
+    print(f"\nScanning for '{image_name}' under: {dataset_dir}")
+    found = sorted(dataset_dir.rglob(image_name))
+    if subset_n:
+        found = found[:subset_n]
+    if not found:
+        print(f"[ERROR] No '{image_name}' found under {dataset_dir}. Nothing to do.")
+        return
+    print(f"Found {len(found)} '{image_name}' file(s)"
+          + (f"  (dry-run: scan capped at first {subset_n})" if subset_n else "") + ".")
+
+    # ---- Step 2: compute depth, saving to the mirrored sibling tree --------- #
+    out_fn = lambda p: _sibling_map_path(Path(p), dataset_dir, sibling_root, "_depth_map")
+    path_to_depth = precompute_depths_from_paths(
+        image_paths=[str(p) for p in found],
+        output_dir=output_dir,            # not used for saving (out_fn overrides)
+        size=size,
+        batch_size=batch_size,
+        model_name=model_name,
+        device=device,
+        skip_existing=skip_existing,
+        local_files_only=local_files_only,
+        out_path_fn=out_fn,
+    )
+
+    # ---- Step 3: index computed depths by NORMALISED absolute image path --- #
+    depth_by_img = {
+        os.path.normcase(str(Path(img).resolve())): dep
+        for img, dep in path_to_depth.items()
+    }
+
+    # ---- Step 4: rebuild each split manifest, matching by absolute path ---- #
+    for split in ("train", "val", "test"):
+        src = _find_split_jsonl(data_dir, split)
+        if src is None:
+            print(f"\n[WARN] No JSONL for split '{split}' in {data_dir} — skipping.")
+            continue
+
+        with open(src, "r", encoding="utf-8") as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+
+        out_entries = []
+        n_skipped = 0
+        for entry in entries:
+            raw_str = _get_image_path(entry, image_path)
+            key = os.path.normcase(str(Path(raw_str).resolve()))
+            dep = depth_by_img.get(key)
+            if dep is None:
+                # Image not among the scanned/computed set (in a full run this
+                # means the file was missing on disk; in a dry run it just wasn't
+                # in the capped subset). Skip to keep the mapping honest.
+                n_skipped += 1
+                continue
+            out_entries.append({
+                "raw_image_path": Path(raw_str).resolve().as_posix(),
+                "depth_path":     Path(dep).resolve().as_posix(),
+                "prompt":         entry["prompt"],
+            })
+
+        out_path = output_dir / f"{split}.jsonl"
+        with open(out_path, "w", encoding="utf-8") as f:
+            for e in out_entries:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+        if subset_n:
+            note = f"  (dry-run: {n_skipped} entries not in the scanned subset — expected)"
+        else:
+            note = f"  ({n_skipped} entries had no depth on disk — skipped)" if n_skipped else ""
+        print(f"\n  Written {len(out_entries)} entries -> {out_path}{note}")
+        _verify_scan_training_jsonl(out_path, "depth_path", "_depth_map")
 
 
 def run_json_mode(args):
@@ -718,11 +960,30 @@ def main():
                         help="Device: 'cuda' or 'cpu'. Default: cuda if available")
     parser.add_argument("--no_skip", action="store_true",
                         help="Re-compute even if depth PNG already exists.")
-    parser.add_argument("--source_key", type=str, default="source",
+    parser.add_argument("--image_path", type=str, default="source",
                         help="Key in your input JSONLs that holds the image path. "
                              "Default: 'source'. Change to 'target' (or any other key) "
                              "if your manifests use a different name. "
-                             "Example: --source_key target")
+                             "Example: --image_path target")
+    parser.add_argument("--image_root", type=str, default=None,
+                        help="Root folder prepended to RELATIVE image paths from the JSONL. "
+                             "Use this when images are NOT under the repo root. "
+                             "Example: --image_root /mnt/dataset  (then JSONL path "
+                             "'images/foo.jpg' resolves to /mnt/dataset/images/foo.jpg). "
+                             "Absolute paths in the JSONL are always used as-is.")
+
+    # ---- Dataset-SCAN mode (find raw_image.jpg by scanning a folder) ------- #
+    parser.add_argument("--dataset_dir", type=str, default=None,
+                        help="Activates DATASET-SCAN mode. Recursively scans this folder "
+                             "for files named --image_name (default raw_image.jpg), computes "
+                             "a depth map for each, and saves it IN the image's own folder as "
+                             "<folder>_depth_map.png. Requires --data_dir (the folder holding "
+                             "train/val/test.jsonl) to recover each image's prompt + split. "
+                             "Example: --dataset_dir /data/custome_dataset --data_dir data/ --image_path target")
+    parser.add_argument("--image_name", type=str, default="raw_image.jpg",
+                        help="(scan mode) Exact filename to process in each folder. "
+                             "Every other file is ignored — including *_depth_map.png / "
+                             "*_seg_map.png this pipeline writes. Default: raw_image.jpg")
 
     args = parser.parse_args()
 
@@ -733,10 +994,11 @@ def main():
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     # Validate: need at least one input mode
-    if not args.data_dir and not args.input_dir and not args.json_file:
+    if not args.dataset_dir and not args.data_dir and not args.input_dir and not args.json_file:
         parser.error(
             "Provide one of:\n"
-            "  --data_dir data/              (recommended — builds depth_training/*.jsonl)\n"
+            "  --dataset_dir /data/custome_dataset --data_dir data/  (scan mode — saves maps in-folder)\n"
+            "  --data_dir data/              (builds depth_training/*.jsonl from JSONL paths)\n"
             "  --input_dir data/raw          (directory mode)\n"
             "  --json_file data/train.jsonl  (single-JSONL mode)"
         )
@@ -744,11 +1006,45 @@ def main():
     if args.data_dir and args.input_dir:
         parser.error("--data_dir and --input_dir are mutually exclusive.")
 
+    if args.dataset_dir and not args.data_dir:
+        parser.error(
+            "--dataset_dir (scan mode) also needs --data_dir pointing at the folder that "
+            "holds train/val/test.jsonl — that is where each image's prompt + split come from.\n"
+            "  Example: --dataset_dir /data/custome_dataset --data_dir data/ --image_path target"
+        )
+
     print(f"Device : {args.device}")
     print(f"Size   : {args.size}x{args.size}")
     print(f"Batch  : {args.batch_size}")
 
-    if args.data_dir:
+    if args.dataset_dir:
+        # DATASET-SCAN mode: find raw_image.jpg by scanning, save maps in-folder,
+        # rebuild depth_training/{train,val,test}.jsonl from the original splits.
+        dataset_dir = Path(args.dataset_dir).resolve()
+        data_dir    = Path(args.data_dir).resolve()
+        out_dir     = Path(args.output_dir).resolve() if args.output_dir else data_dir / "depth_training"
+
+        if not dataset_dir.exists():
+            parser.error(f"--dataset_dir not found: {dataset_dir}")
+        if args.dry_run_n:
+            print(f"\n[DRY RUN] Scan capped at first {args.dry_run_n} images.")
+
+        build_depth_training_from_scan(
+            dataset_dir=dataset_dir,
+            data_dir=data_dir,
+            output_dir=out_dir,
+            image_name=args.image_name,
+            image_path=args.image_path,
+            size=args.size,
+            batch_size=args.batch_size,
+            model_name=args.model,
+            device=args.device,
+            skip_existing=not args.no_skip,
+            local_files_only=args.local_files_only,
+            subset_n=args.dry_run_n,
+        )
+
+    elif args.data_dir:
         # Depth-training JSON mode: read data/{train,val,test}.json,
         # compute depths, write depth_training/{train,val,test}.json
         data_dir  = Path(args.data_dir).resolve()
@@ -759,9 +1055,12 @@ def main():
         if args.dry_run_n:
             print(f"\n[DRY RUN] Processing first {args.dry_run_n} entries per JSON.")
 
+        image_root = Path(args.image_root).resolve() if args.image_root else None
+        if image_root:
+            print(f"Image root : {image_root}  (prepended to relative image paths)")
         build_depth_training_jsons(
             data_dir=data_dir,
-            raw_dir=raw_dir,
+            raw_dir=raw_dir if args.raw_dir else (image_root or data_dir / "raw"),
             depth_dir=depth_dir,
             output_dir=out_dir,
             size=args.size,
@@ -771,7 +1070,8 @@ def main():
             skip_existing=not args.no_skip,
             subset_n=args.dry_run_n,
             local_files_only=args.local_files_only,
-            source_key=args.source_key,
+            image_path=args.image_path,
+            image_root=image_root,
         )
 
     elif args.json_file and not args.input_dir:

@@ -209,128 +209,165 @@ Our `SegmentationEncoder` in `src/encoders/seg_encoder.py` was deliberately desi
 
 ### 5.2 Image Discovery and Path Control — how the pipeline finds your images
 
-This section answers: where does the pipeline look for images, what key in the JSONL tells it where the image is, and what do you change if your dataset has a different folder structure or filename convention?
+This section answers: where does the pipeline look for images, what key in the JSONL tells it where the image is, and what do you change if your images live somewhere else?
 
 #### The three JSONL file types and their key names
-
-There are three distinct JSONL formats in this pipeline. Each uses a different key to store the image path:
 
 ```
 data/train.jsonl                          ← source split (created by dataset prep)
   {"source": "data/raw/000417/raw_image.jpg", "prompt": "..."}
-   ▲ key = "source"
+   ▲ default key = "source"
 
-data/depth_training/train.jsonl           ← depth training manifest (created by depth_map_calculations.py)
+data/depth_training/train.jsonl           ← depth training manifest (output of Stage A)
   {"raw_image_path": "data/raw/000417/raw_image.jpg", "depth_path": "...", "prompt": "..."}
-   ▲ key = "raw_image_path"
-
-data/seg_training/train.jsonl             ← seg training manifest (created by seg_map_calculations.py)
-  {"raw_image_path": "data/raw/000417/raw_image.jpg", "seg_path": "...", "prompt": "..."}
    ▲ key = "raw_image_path"
 ```
 
 Image filename is always `raw_image.jpg` — the folder name (`000417/`) is the scene identifier.
 
-#### The current two-step check and its problem
+#### `--image_path` — tell the script which key holds the image path
 
-`depth_map_calculations.py` uses `_get_source_key()` which does a sequential key-name lookup:
+The CLI arg `--image_path` sets which key the script reads from each JSONL entry. Default is `"source"`. If your JSONL uses `"target"` (or any other name), pass it explicitly:
 
-```python
-# depth_map_calculations.py — current implementation
-def _get_source_key(entry: dict) -> str:
-    if "source" in entry:          # check 1: source split format
-        return entry["source"]
-    if "raw_image_path" in entry:  # check 2: training manifest format
-        return entry["raw_image_path"]
-    raise KeyError(f"Entry has neither 'source' nor 'raw_image_path' key. ...")
+```bash
+# Your JSONL has {"source": "...", "prompt": "..."}  → default, no flag needed
+python depth_map_calculations.py --data_dir data/
+
+# Your JSONL has {"target": "...", "prompt": "..."}
+python depth_map_calculations.py --data_dir data/ --image_path target
 ```
 
-**Problem:** if you change the key name in your JSONL, you must find and update this function. If you add a third format, you add a third elif. The key name is buried in logic rather than declared as a constant. There is no single place to change "what is the image key called" across the whole script.
+The key name flows from CLI → `_get_image_path(entry, image_path)` → file open. Nothing else in the script hard-codes a key name.
 
-#### One-step configurable replacement
+#### `--image_root` — required whenever images live OUTSIDE the repo
 
-Replace the two-step check with one constant at the top of the script and one resolver function. If the key name or filename ever changes, you change ONE line:
+`--image_root` does two things, both needed for external datasets:
 
-```python
-# ── IMAGE DISCOVERY CONSTANTS ─────────────────────────────────────────────── #
-# These are the ONLY two places that know about key names and filenames.
-# Change them here and every function in this file picks up the change.
+1. **Path resolution**: prepend to relative paths in JSONL to build the absolute path to each image.
+2. **Folder mirroring**: used as the base to compute where the depth PNG goes inside `data/raw_depth/`, preserving the full nested structure.
 
-SOURCE_KEY = "source"         # key that holds the image path in the SOURCE split JSONL
-                               # (data/train.jsonl, data/val.jsonl, data/test.jsonl)
-                               # Change to "raw_image_path" if you use training manifests as input.
-                               # Change to "image" or any other name if your dataset uses it.
+**Without `--image_root` — collision disaster (VERIFIED):**
 
-IMAGE_NAME = "raw_image.jpg"  # expected filename at the end of every image path.
-                               # Set to None to disable the filename check entirely.
-# ────────────────────────────────────────────────────────────────────────────── #
+If your images are external (e.g. `/workstation/dataset/sceneA/subdir/raw_image.jpg`) and you don't set `--image_root`, ALL depth maps land at the same path `data/raw_depth/raw_image.png` and every image overwrites the previous one. This is silent data loss.
 
-
-def resolve_image_path(entry: dict, cwd: Path) -> Path:
-    """
-    Single-step: get the absolute image path from one JSONL entry.
-
-    This is the ONLY function that reads the image path from an entry.
-    All other functions call this; none of them know the key name directly.
-
-    Steps in ONE pass:
-      1. Check SOURCE_KEY exists → fail loud with instructions if not.
-      2. Build absolute path (relative paths resolved from cwd = repo root).
-      3. Check filename matches IMAGE_NAME → fail loud if not (unless IMAGE_NAME is None).
-
-    To adapt to a new dataset:
-      • Different key name  → change SOURCE_KEY above.
-      • Different filename  → change IMAGE_NAME above.
-      • No filename check   → set IMAGE_NAME = None above.
-    """
-    if SOURCE_KEY not in entry:
-        raise KeyError(
-            f"JSONL entry has no '{SOURCE_KEY}' key.\n"
-            f"  Found keys : {list(entry.keys())}\n"
-            f"  Fix        : update SOURCE_KEY at the top of this file to match your JSONL."
-        )
-
-    raw = entry[SOURCE_KEY]
-    path = Path(raw)
-    abs_path = path if path.is_absolute() else cwd / path
-
-    if IMAGE_NAME is not None and abs_path.name != IMAGE_NAME:
-        raise ValueError(
-            f"Image filename '{abs_path.name}' does not match expected '{IMAGE_NAME}'.\n"
-            f"  Full path  : {abs_path}\n"
-            f"  Fix        : update IMAGE_NAME at the top of this file, "
-            f"or set IMAGE_NAME = None to skip this check."
-        )
-
-    return abs_path
-```
-
-#### Why one step is better than two
-
-| | Two-step (`_get_source_key`) | One-step (`resolve_image_path`) |
-|---|---|---|
-| Key name knowledge | Buried inside `if` chain | Declared once as `SOURCE_KEY = "..."` |
-| Filename check | Not done | Done in same pass, same function |
-| Adding a new format | Add another `elif` | Change one constant |
-| Finding "where is the image key" | Search the function | Read the constant at the top of the file |
-| Error message quality | "Entry has neither X nor Y key" | "Update SOURCE_KEY at the top of this file" |
-
-#### The full discovery flow
+**With `--image_root /workstation` — correct nested output (VERIFIED):**
 
 ```
-data/                          ← --data_dir
-  train.jsonl    ─┐
-  val.jsonl       ├── discovered by _find_split_jsonl(data_dir, "train"/"val"/"test")
-  test.jsonl     ─┘   (looks for exact name, then any *.jsonl with split name in stem)
-      │
-      │ each line is one JSONL entry
-      ▼
-  resolve_image_path(entry, cwd)
-      │
-      ├─ 1. entry[SOURCE_KEY]          → "data/raw/000417/raw_image.jpg"
-      ├─ 2. cwd / path                 → D:\...\LoRAdapter\data\raw\000417\raw_image.jpg
-      └─ 3. abs_path.name == "raw_image.jpg"  ✓ (or IMAGE_NAME=None to skip)
+/workstation/dataset/sceneA/lvl1/raw_image.jpg      → data/raw_depth/dataset/sceneA/lvl1/raw_image.png
+/workstation/dataset/sceneB/lvl1/raw_image.jpg      → data/raw_depth/dataset/sceneB/lvl1/raw_image.png
+/workstation/dataset/run_001/cam_left/raw_image.jpg → data/raw_depth/dataset/run_001/cam_left/raw_image.png
 ```
+
+The folder depth can be arbitrary — any nesting is preserved. Folders can have any names. Other images in the same end-folder (e.g. `thumbnail.jpg`, `mask.png`) are naturally ignored because the script only processes paths listed in the JSONL — it never scans directories.
+
+**Rule: set `--image_root` to the COMMON ROOT of all image paths in your JSONL.**
+
+```bash
+# Images at /workstation/custom_dataset/... — relative paths in JSONL
+python depth_map_calculations.py --data_dir data/ --image_path target \
+  --image_root /workstation
+
+# Images at /workstation/custom_dataset/... — absolute paths in JSONL
+# (image_root is NOT used for resolution here, but still needed for folder mirroring)
+python depth_map_calculations.py --data_dir data/ --image_path target \
+  --image_root /workstation
+```
+
+#### The full discovery → depth → output flow (VERIFIED by execution)
+
+```
+data/train.jsonl                               ← --data_dir
+  {"target": "data/raw/000417/raw_image.jpg", "prompt": "..."}
+       │
+       │ --image_path target
+       ▼
+  _get_image_path(entry, "target")
+       │  → "data/raw/000417/raw_image.jpg"
+       ▼
+  image_root / raw_str    (repo_root / raw_str when --image_root not set)
+       │  → /repo/data/raw/000417/raw_image.jpg   (resolved absolute path)
+       │
+       │ other files in same folder (thumbnail.jpg, mask.png, etc.)
+       │ are NOT touched — only JSONL-listed paths are processed
+       ▼
+  DepthEstimator.forward(image)   → depth tensor [1, 512, 512] in [0,1]
+       │
+       ▼
+  _depth_out_path: mirrors nested folder structure under --image_root
+       │  → data/raw_depth/000417/raw_image.png
+       ▼
+  data/depth_training/train.jsonl  (output — VERIFIED mapping)
+  {
+    "raw_image_path": "data/raw/000417/raw_image.jpg",   ← original path, unchanged
+    "depth_path":     "data/raw_depth/000417/raw_image.png",
+    "prompt":         "this is a close up of a person holding a map..."  ← verbatim
+  }
+```
+
+#### Quick reference
+
+| Situation | Command |
+|---|---|
+| Images inside repo, JSONL key = `"source"` (default) | `python depth_map_calculations.py --data_dir data/` |
+| Images inside repo, JSONL key = `"target"` | `... --image_path target` |
+| Images outside repo, any key | `... --image_path target --image_root /path/to/common/root` |
+| Quick smoke-test | `... --dry_run_n 5` |
+
+**Never omit `--image_root` when images are outside the repo.** Without it, all depth maps write to the same file and your data is silently corrupted.
+
+### 5.2b Dataset-scan mode (`--dataset_dir`) — save maps in a SIBLING, mirrored tree [VERIFIED]
+
+This is the mode for a dataset that lives OUTSIDE the repo, where each scene folder contains `raw_image.jpg` (plus possibly other files). Instead of trusting JSONL paths to *find* images, the script **scans the folder** and finds `raw_image.jpg` directly. The depth map is saved into a **new sibling folder** next to the dataset root, mirroring the dataset's internal structure — **the source dataset folder is never written into.**
+
+**Command:**
+```bash
+python depth_map_calculations.py \
+  --dataset_dir /path/to/custome_dataset \
+  --data_dir data/ \
+  --image_path target
+```
+
+**What each argument does:**
+- `--dataset_dir` — the folder to scan recursively for `raw_image.jpg`. Activates scan mode.
+- `--data_dir` — folder holding `train/val/test.jsonl`. Used ONLY to recover each image's **prompt** and which **split** it belongs to (matched by absolute image path). Required.
+- `--image_path` — the JSONL key holding the image path (`target` here).
+- `--image_name` — the exact filename to process (default `raw_image.jpg`). Every other file in the folder is ignored, so the source dataset can freely contain other images per folder.
+
+**Where the sibling folder is created:** automatically derived from `--dataset_dir` — no separate flag needed.
+```
+--dataset_dir  = /path/to/custome_dataset
+sibling output = /path/to/custome_dataset_depth_map     (same parent, name + "_depth_map")
+```
+
+**What it produces (VERIFIED on a 914-folder dataset):**
+```
+/path/custome_dataset/000417/raw_image.jpg              ← input (found by scan, untouched)
+
+/path/custome_dataset_depth_map/000417/000417_depth_map.png
+                                                          ← NEW sibling tree, mirrors internal structure,
+                                                            file named after the leaf folder
+
+data/depth_training/train.jsonl   (+ val, test)          ← rebuilt from the originals:
+  {
+    "raw_image_path": "/path/custome_dataset/000417/raw_image.jpg",               ← absolute, unchanged
+    "depth_path":     "/path/custome_dataset_depth_map/000417/000417_depth_map.png",
+    "prompt":         "..."                                                        ← from the split JSONL, verbatim
+  }
+```
+
+**Key guarantees (all verified by execution, including two deliberate negative tests):**
+- The source dataset folder is **never modified** — verified: after a scan run, `custome_dataset/000417/` contains only `raw_image.jpg`, nothing else.
+- Only `raw_image.jpg` is processed — other files/images in the folder are ignored.
+- The prompt + split for each image are preserved exactly (matched by absolute path against the original `data/*.jsonl`).
+- Output JSONL paths are absolute (the data lives outside the repo).
+- Re-runs skip already-computed maps unless you pass `--no_skip`.
+- The verifier (`_verify_scan_training_jsonl`) was fed known-bad cases (map written in-folder instead of sibling; map under the wrong mirrored leaf-folder name) and correctly FAILed both, while passing the valid entry — so a FAIL from this checker is a real signal, not an unproven check.
+
+**Dry run first:**
+```bash
+python depth_map_calculations.py --dataset_dir /path/custome_dataset --data_dir data/ --image_path target --dry_run_n 6
+```
+In a dry run the scan is capped to the first N images; split JSONLs contain only the entries whose images were in that capped set (the rest are reported as "not in the scanned subset — expected").
 
 ### 5.3 skip_encode — Training vs Inference Path
 

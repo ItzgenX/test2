@@ -255,93 +255,129 @@ Both the offline calc script (via `SegJsonDataset`) and the live encoder (`Segme
 
 ### 5.3 Image Discovery and Path Control — how the pipeline finds your images
 
-Identical concept to DEPTH.md §5.2 — read that first. The differences for segmentation are the key names. This section documents the seg-specific values and the configurable one-step pattern.
+Same mechanics as DEPTH.md §5.2 — read that for the complete explanation. This section states the seg-specific values and repeats the critical `--image_root` rule.
 
-#### The three JSONL file types and their key names
+#### The JSONL file types and their key names
 
 ```
 data/train.jsonl                          ← source split
-  {"source": "data/raw/000417/raw_image.jpg", "prompt": "..."}
-   ▲ key = "source"
+  {"target": "data/raw/000417/raw_image.jpg", "prompt": "..."}
+   ▲ key name set by --image_path (default "source", commonly "target")
 
-data/seg_training/train.jsonl             ← seg training manifest
-  {"raw_image_path": "data/raw/000417/raw_image.jpg", "seg_path": "data/raw_seg/000417/raw_image.png", "prompt": "..."}
-   ▲ key = "raw_image_path"               ▲ this is the saved class-ID PNG, not the RGB image
-```
-
-Image filename is always `raw_image.jpg`. The seg-map filename is always `raw_image.png` (same stem, different extension — PNG to avoid JPEG compression on class-ID values).
-
-#### One-step configurable discovery (same pattern as depth)
-
-`seg_map_calculations.py` uses `_get_source_key()` — same two-step check as depth. Replace with:
-
-```python
-# ── IMAGE DISCOVERY CONSTANTS (seg_map_calculations.py) ────────────────────── #
-SOURCE_KEY = "source"         # key holding the image path in the source split JSONL
-                               # Change to "raw_image_path" when reading training manifests.
-IMAGE_NAME = "raw_image.jpg"  # expected filename. Set to None to skip the check.
-# ─────────────────────────────────────────────────────────────────────────────── #
-
-
-def resolve_image_path(entry: dict, cwd: Path) -> Path:
-    """
-    Single-step: get the absolute image path from one JSONL entry.
-
-    This is the ONLY function that reads the image path.
-    Seg-pipeline prefix: "resolve_seg_image_path" if you want strict naming.
-
-    Steps in ONE pass:
-      1. Check SOURCE_KEY exists → fail loud with fix instructions.
-      2. Build absolute path (relative paths resolved from cwd = repo root).
-      3. Check filename matches IMAGE_NAME → fail loud if mismatch (unless None).
-
-    To adapt:
-      • Different key name  → change SOURCE_KEY at the top of this file.
-      • Different filename  → change IMAGE_NAME at the top of this file.
-      • No filename check   → set IMAGE_NAME = None.
-    """
-    if SOURCE_KEY not in entry:
-        raise KeyError(
-            f"JSONL entry has no '{SOURCE_KEY}' key.\n"
-            f"  Found keys : {list(entry.keys())}\n"
-            f"  Fix        : update SOURCE_KEY at the top of seg_map_calculations.py."
-        )
-    path = Path(entry[SOURCE_KEY])
-    abs_path = path if path.is_absolute() else cwd / path
-    if IMAGE_NAME is not None and abs_path.name != IMAGE_NAME:
-        raise ValueError(
-            f"Image filename '{abs_path.name}' != expected '{IMAGE_NAME}'.\n"
-            f"  Full path : {abs_path}\n"
-            f"  Fix       : update IMAGE_NAME at the top of seg_map_calculations.py."
-        )
-    return abs_path
-```
-
-#### The full seg discovery flow
-
-```
-data/                          ← --data_dir
-  train.jsonl   ─┐
-  val.jsonl      ├── discovered by _find_split_jsonl(data_dir, "train"/"val"/"test")
-  test.jsonl    ─┘
-      │ each line: {"source": "data/raw/000417/raw_image.jpg", "prompt": "..."}
-      ▼
-  resolve_image_path(entry, cwd)
-      │
-      ├─ 1. entry["source"]    → "data/raw/000417/raw_image.jpg"
-      ├─ 2. cwd / path         → D:\...\LoRAdapter\data\raw\000417\raw_image.jpg
-      └─ 3. .name == "raw_image.jpg"  ✓
-      │
-      ▼
-  SegmentationEncoder.label_ids(tensor)   → class-ID map [512, 512]
-      │
-      ▼
-  saved to data/raw_seg/000417/raw_image.png   (same folder structure as raw/)
-      │
-  seg_training/train.jsonl entry:
+data/seg_training/train.jsonl             ← seg training manifest (output of Stage C)
   {"raw_image_path": "data/raw/000417/raw_image.jpg",
    "seg_path":       "data/raw_seg/000417/raw_image.png",
-   "prompt":         "..."}
+   "prompt": "..."}
+```
+
+The seg-map is always `.png` (lossless, preserves integer class-ID values). Other files in the same folder — including other `.jpg` and `.png` files — are completely ignored; the script processes only paths listed in the JSONL, never scans directories.
+
+#### `--image_path` — which key holds the image path
+
+```bash
+python seg_map_calculations.py --data_dir data/ --image_path target
+```
+
+Pass whatever key your JSONL uses. Default is `"source"`.
+
+#### `--image_root` — REQUIRED when images are outside the repo
+
+`--image_root` serves two purposes: (1) resolving relative paths to absolute, and (2) computing the correct nested output path under `data/raw_seg/`. **Without it, all seg maps write to the same file and overwrite each other.**
+
+```
+# Without --image_root — ALL images → data/raw_seg/raw_image.png  ← COLLISION
+# With --image_root /workstation:
+/workstation/dataset/sceneA/lvl1/raw_image.jpg  → data/raw_seg/dataset/sceneA/lvl1/raw_image.png
+/workstation/dataset/sceneB/lvl1/raw_image.jpg  → data/raw_seg/dataset/sceneB/lvl1/raw_image.png
+/workstation/dataset/run_001/cam_left/raw_image.jpg → data/raw_seg/dataset/run_001/cam_left/raw_image.png
+```
+
+Set `--image_root` to the COMMON ROOT of all image paths in your JSONL. Folder depth can be arbitrary.
+
+#### The full seg discovery → output flow (VERIFIED by execution)
+
+```
+data/train.jsonl                               ← --data_dir
+  {"target": "data/raw/000417/raw_image.jpg", "prompt": "..."}
+       │
+       │ --image_path target
+       ▼
+  _get_image_path(entry, "target")
+       │  → "data/raw/000417/raw_image.jpg"
+       ▼
+  image_root / raw_str    (repo_root / raw_str when --image_root not set)
+       │  → /repo/data/raw/000417/raw_image.jpg
+       │
+       │ other files in same folder (other.jpg, mask.png, etc.) NOT touched
+       ▼
+  SegmentationEncoder.label_ids(image)   → class-ID map [H, W] integer
+       │
+       ▼
+  seg_colorize_ids(ids, palette) → RGB colour map [3, 512, 512]   saved as PNG
+       │  → data/raw_seg/000417/raw_image.png   (nested structure preserved)
+       ▼
+  data/seg_training/train.jsonl  (output — VERIFIED mapping)
+  {
+    "raw_image_path": "data/raw/000417/raw_image.jpg",   ← original path, unchanged
+    "seg_path":       "data/raw_seg/000417/raw_image.png",
+    "prompt":         "..."                               ← verbatim
+  }
+```
+
+#### Quick reference
+
+| Situation | Command |
+|---|---|
+| Images inside repo, JSONL key = `"source"` | `python seg_map_calculations.py --data_dir data/` |
+| Images inside repo, JSONL key = `"target"` | `... --image_path target` |
+| Images outside repo | `... --image_path target --image_root /path/to/common/root` |
+| Quick smoke-test | `... --dry_run_n 5` |
+
+**Never omit `--image_root` when images are outside the repo.**
+
+### 5.3b Dataset-scan mode (`--dataset_dir`) — save maps in a SIBLING, mirrored tree [VERIFIED]
+
+Identical to DEPTH.md §5.2b, with `_seg_map` instead of `_depth_map`. For a dataset outside the repo, the script **scans** for `raw_image.jpg` and saves each seg map into a **new sibling folder** next to the dataset root, mirroring its internal structure. **The source dataset folder is never written into.**
+
+**Command:**
+```bash
+python seg_map_calculations.py \
+  --dataset_dir /path/to/custome_dataset \
+  --data_dir data/ \
+  --image_path target
+```
+
+**Where the sibling folder is created:** automatically derived from `--dataset_dir`.
+```
+--dataset_dir  = /path/to/custome_dataset
+sibling output = /path/to/custome_dataset_seg_map     (same parent, name + "_seg_map")
+```
+
+**What it produces (VERIFIED on a 914-folder dataset):**
+```
+/path/custome_dataset/000417/raw_image.jpg          ← input (found by scan, untouched)
+
+/path/custome_dataset_seg_map/000417/000417_seg_map.png
+                                                      ← NEW sibling tree, mirrors internal structure
+
+data/seg_training/train.jsonl   (+ val, test)       ← rebuilt from the originals:
+  {
+    "raw_image_path": "/path/custome_dataset/000417/raw_image.jpg",           ← absolute, unchanged
+    "seg_path":       "/path/custome_dataset_seg_map/000417/000417_seg_map.png",
+    "prompt":         "..."                                                    ← from the split JSONL, verbatim
+  }
+```
+
+**Arguments** are identical to depth's scan mode: `--dataset_dir` (scan root), `--data_dir` (split + prompt source, required), `--image_path` (JSONL key), `--image_name` (default `raw_image.jpg`).
+
+**Verified guarantees (execution + two deliberate negative tests):**
+- The source dataset folder is never modified — verified: `custome_dataset/000417/` contains only `raw_image.jpg` after a scan run, both depth and seg maps land in their own sibling trees.
+- Running seg scan and depth scan back-to-back on the same dataset **does not interfere** — each writes to its own sibling folder (`custome_dataset_depth_map/` vs `custome_dataset_seg_map/`), and each scan still only picks up `raw_image.jpg`, ignoring the other pipeline's sibling folder entirely (verified: 6 seg maps from 6 folders that already had depth maps, not 12).
+- The verifier (`_verify_scan_seg_training_jsonl`) was fed known-bad cases (map in-folder instead of sibling; wrong mirrored leaf-folder name) and correctly FAILed both while passing the valid entry.
+
+**Dry run first:**
+```bash
+python seg_map_calculations.py --dataset_dir /path/custome_dataset --data_dir data/ --image_path target --dry_run_n 6
 ```
 
 ### 5.4 NEAREST Interpolation for Class IDs
