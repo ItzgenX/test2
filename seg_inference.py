@@ -38,15 +38,22 @@ OUTPUT MODES:
 USAGE:
   # Standard single/multi image inference:
   python seg_inference.py \\
-      ckpt_path=outputs/train/seg/runs/2024-01-01/00-00-00/checkpoint-3000 \\
+      ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/best_model \\
       inference.json_file=data/seg_training/test.jsonl \\
-      inference.output_dir=results/seg
+      inference.output_dir=outputs/inference/seg/results
 
   # Direct image:
   python seg_inference.py \\
-      ckpt_path=outputs/train/seg/runs/2024-01-01/00-00-00/checkpoint-3000 \\
-      "inference.images=[data/raw/000417/raw_image.jpg]" \\
-      "inference.prompts=['driving in rain at night']"
+      ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/best_model \\
+      "inference.images=[data/raw/000888/raw_image.jpg]" \\
+      "inference.prompts=['two windows on a brick building with vines']"
+
+QUICK COMMANDS (run from repo root with conda loradapter env active):
+  # --- Single image dry run (replace YYYY-MM-DD/HH-MM-SS with actual run folder) ---
+  python seg_inference.py ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/best_model "inference.images=[data/raw/000888/raw_image.jpg]" "inference.prompts=['two windows on a brick building with vines']"
+
+  # --- Batch test-set inference ---
+  python seg_inference.py ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/best_model inference.json_file=data/seg_training/test.jsonl
 """
 
 import hydra

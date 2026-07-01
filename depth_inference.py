@@ -33,21 +33,29 @@ OUTPUT MODES:
 USAGE:
   # Standard single/multi image inference:
   python depth_inference.py \\
-      ckpt_path=outputs/train/runs/2024-01-01/00-00-00/checkpoint-3000 \\
-      inference.json_file=dataset.json \\
-      inference.output_dir=results
+      ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model \\
+      inference.json_file=data/depth_training/test.jsonl \\
+      inference.output_dir=outputs/inference/depth/results
 
-  # Batch evaluate test.json — only generated images, mirrored folder structure:
+  # Batch evaluate — only generated images, mirrored folder structure:
   python depth_inference.py \\
-      ckpt_path=outputs/train/runs/2024-01-01/00-00-00/checkpoint-3000 \\
-      inference.json_file=data/test.json \\
-      inference.output_dir=results/test_eval \\
+      ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model \\
+      inference.json_file=data/depth_training/test.jsonl \\
+      inference.output_dir=outputs/inference/depth/results \\
       inference.save_generated_only=true
 
+  # Single image with prompt:
   python depth_inference.py \\
-      ckpt_path=outputs/train/runs/2024-01-01/00-00-00/checkpoint-3000 \\
-      "inference.images=[data/cat.jpg]" \\
-      "inference.prompts=['a realistic photo of a cat']"
+      ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model \\
+      "inference.images=[data/raw/000888/raw_image.jpg]" \\
+      "inference.prompts=['two windows on a brick building']"
+
+QUICK COMMANDS (run from repo root with conda loradapter env active):
+  # --- Single image dry run (replace YYYY-MM-DD/HH-MM-SS with actual run folder) ---
+  python depth_inference.py ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model "inference.images=[data/raw/000888/raw_image.jpg]" "inference.prompts=['two windows on a brick building with vines']"
+
+  # --- Batch test-set inference ---
+  python depth_inference.py ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model inference.json_file=data/depth_training/test.jsonl
 """
 
 import hydra

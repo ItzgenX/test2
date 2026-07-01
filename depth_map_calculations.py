@@ -22,17 +22,24 @@ JSON MANIFEST FORMAT:
   ]
   After running: "depth_path" key is added to each entry automatically.
 
-TYPICAL WORKFLOW (directory mode — recommended):
-  # Step 1: compute depths for all images, auto-updates train/val/test.json
-  python depth_map_calculations.py --input_dir data/images --output_dir data/depths
-  # Scans data/images/, saves depth PNGs to data/depths/,
-  # then finds data/train.json + data/test.json and fills "depth_path" fields.
-
+TYPICAL WORKFLOW (--data_dir mode — recommended):
+  # Step 1: compute depths for all images, builds depth_training/train+val+test.jsonl
+  python depth_map_calculations.py --data_dir data/
   # Step 2: train
-  python depth_training.py experiment=train_depth_12gb
+  python depth_training.py experiment=train_depth
 
-ALTERNATIVE (JSON mode — when you already have a JSON file):
-  python depth_map_calculations.py --json_file data/train.json --output_dir data/depths
+ALTERNATIVE (JSON mode — when you already have a single JSON file):
+  python depth_map_calculations.py --json_file data/train.jsonl --output_dir data/depths
+
+QUICK COMMANDS (run from repo root with conda loradapter env active):
+  # --- Dry run: 15 images, verify pipeline before committing to full dataset ---
+  python depth_map_calculations.py --data_dir data/ --dry_run_n 15
+
+  # --- Full run: all images (639 train + 137 val + 137 test) ---
+  python depth_map_calculations.py --data_dir data/
+
+  # --- Re-compute everything (force overwrite of existing PNGs) ---
+  python depth_map_calculations.py --data_dir data/ --no_skip
 """
 
 import argparse

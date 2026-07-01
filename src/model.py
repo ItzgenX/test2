@@ -579,7 +579,7 @@ class SD15(ModelBase):
 
             neg_c = torch.zeros_like(c)
             if cfg_mask is not None and not cfg_mask[i]:
-                print("no cfg for lora nr", i)
+                pass  # cfg disabled for this LoRA (cfg_mask[i]=False)
                 c = torch.cat([c, c])
             else:
                 c = torch.cat([neg_c, c])
@@ -691,7 +691,7 @@ class SD15(ModelBase):
 
             neg_c = torch.zeros_like(c)
             if cfg_mask is not None and not cfg_mask[i]:
-                print("no cfg for lora nr", i)
+                pass  # cfg disabled for this LoRA (cfg_mask[i]=False)
                 c = torch.cat([c, c])
             else:
                 c = torch.cat([neg_c, c])
@@ -910,7 +910,7 @@ class SDXL(ModelBase):
             neg_c = torch.zeros_like(c)
             if self.guidance_scale > 1:
                 if cfg_mask is not None and not cfg_mask[i]:
-                    print("no cfg for lora nr", i)
+                    pass  # cfg disabled for this LoRA (cfg_mask[i]=False)
                     c = torch.cat([c, c])
                 else:
                     c = torch.cat([neg_c, c])

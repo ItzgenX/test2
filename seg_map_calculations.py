@@ -27,11 +27,21 @@ LOCKED MODEL: nvidia/segformer-b5-finetuned-cityscapes-1024-1024
   (references.md §9 — b5 chosen for best segmentation accuracy)
 
 TYPICAL WORKFLOW (data_dir mode — recommended, mirrors depth):
-  # builds data/seg_training/{train,val,test}.json from data/{train,val,test}.json
+  # builds data/seg_training/{train,val,test}.jsonl from data/{train,val,test}.jsonl
   python seg_map_calculations.py --data_dir data/
 
   # then train:
   python seg_training.py experiment=train_seg
+
+QUICK COMMANDS (run from repo root with conda loradapter env active):
+  # --- Dry run: 15 images, verify pipeline before committing to full dataset ---
+  python seg_map_calculations.py --data_dir data/ --dry_run_n 15
+
+  # --- Full run: all images (639 train + 137 val + 137 test) ---
+  python seg_map_calculations.py --data_dir data/
+
+  # --- Re-compute everything (force overwrite of existing PNGs) ---
+  python seg_map_calculations.py --data_dir data/ --no_skip
 
 JSON ENTRY FORMAT produced:
   {"raw_image_path": "data/raw/000417/raw_image.jpg",

@@ -1,3 +1,29 @@
+"""
+depth_training.py
+-----------------
+STAGE B — train the depth-conditioned LoRAdapter on PRE-SAVED MiDaS depth maps.
+Run depth_map_calculations.py (Stage A) first to build the JSONL manifests.
+
+QUICK COMMANDS (run from repo root with conda loradapter env active):
+  # --- Smoke test (after --dry_run_n 15 calc run; 15 images, 3 short epochs) ---
+  python depth_training.py experiment=train_depth epochs=3 data.batch_size=1 gradient_accumulation_steps=1 val_steps=5 ckpt_steps=10
+
+  # --- Full training (60K dataset, 5 epochs, single 12GB GPU) ---
+  python depth_training.py experiment=train_depth
+
+  # --- Full training — 4x12GB cluster ---
+  accelerate launch --num_processes=4 depth_training.py experiment=train_depth
+
+  # --- Resume from checkpoint ---
+  python depth_training.py experiment=train_depth "lora.struct.ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/checkpoint-epoch1/step1000"
+
+OUTPUT: outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/
+  best_model/          <- weights of the best val/loss checkpoint
+  checkpoint-epochN/   <- per-epoch + per-ckpt_steps checkpoints with sample images
+  logs/tensorboard/    <- TensorBoard event files
+TENSORBOARD: tensorboard --logdir outputs/train/depth/runs/
+"""
+
 import hydra
 import math
 from hydra.utils import get_original_cwd
@@ -532,12 +558,15 @@ def main(cfg):
         if stop_training:
             break
 
-    # ── Final snapshot of the last weights ─────────────────────────────────────
-    # `epoch` keeps its last value after the loop. On normal completion this is the
-    # same weights the end-of-epoch save just wrote, so we reuse that exact folder
-    # name (harmless re-save, no extra folder); it still captures an early-stop.
-    accelerator.wait_for_everyone()
-    save_ckpt_and_grid(f"checkpoint-epoch{epoch + 1}/checkpoint-epoch{epoch + 1}")
+    # ── Final snapshot on early-stop only ─────────────────────────────────────
+    # On normal completion the end-of-last-epoch block above already ran line 556
+    # (save_ckpt_and_grid) for this exact folder — running it again would regenerate
+    # 10 grid images for nothing (~60 s GPU time) and overwrite the files.
+    # On early-stop the epoch loop breaks BEFORE line 556 runs, so this is the
+    # only place that captures the interrupted epoch's final weights + grid.
+    if stop_training:
+        accelerator.wait_for_everyone()
+        save_ckpt_and_grid(f"checkpoint-epoch{epoch + 1}/checkpoint-epoch{epoch + 1}")
 
 
 if __name__ == "__main__":

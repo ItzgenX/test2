@@ -1,8 +1,27 @@
 """
 seg_training.py
-------------
+---------------
 STAGE D — train the segmentation-conditioned LoRAdapter on PRE-SAVED Cityscapes
 colour maps. This is the segmentation twin of depth_training.py.
+
+QUICK COMMANDS (run from repo root with conda loradapter env active):
+  # --- Smoke test (after --dry_run_n 15 calc run; 15 images, 3 short epochs) ---
+  python seg_training.py experiment=train_seg epochs=3 data.batch_size=1 gradient_accumulation_steps=1 val_steps=5 ckpt_steps=10
+
+  # --- Full training (60K dataset, 5 epochs, single 12GB GPU) ---
+  python seg_training.py experiment=train_seg
+
+  # --- Full training — 4x12GB cluster ---
+  accelerate launch --num_processes=4 seg_training.py experiment=train_seg
+
+  # --- Resume from checkpoint ---
+  python seg_training.py experiment=train_seg "lora.struct.ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/checkpoint-epoch1/step1000"
+
+OUTPUT: outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/
+  best_model/          <- weights of the best val/loss checkpoint
+  checkpoint-epochN/   <- per-epoch + per-ckpt_steps checkpoints with sample images
+  logs/tensorboard/    <- TensorBoard event files
+TENSORBOARD: tensorboard --logdir outputs/train/seg/runs/
 
 STRUCTURE: this file is a deliberate line-for-line mirror of depth_training.py, with
 exactly three categories of change:
@@ -613,12 +632,17 @@ def main(cfg):
         if stop_training:
             break
 
-    # ── Final snapshot of the last weights ────────────────────────────────────
-    # Reuses the end-of-epoch folder (no extra folder), capturing early-stop too.
-    accelerator.wait_for_everyone()
-    save_seg_ckpt_and_grid(
-        f"checkpoint-epoch{epoch + 1}/checkpoint-epoch{epoch + 1}"
-    )
+    # ── Final snapshot on early-stop only ─────────────────────────────────────
+    # On normal completion the end-of-last-epoch block above already ran
+    # save_seg_ckpt_and_grid for this exact folder — running it again would
+    # regenerate 10 grid images for nothing (~60 s GPU time) and overwrite them.
+    # On early-stop the epoch loop breaks BEFORE that block runs, so this is the
+    # only place capturing the interrupted epoch's final weights + grid.
+    if stop_training:
+        accelerator.wait_for_everyone()
+        save_seg_ckpt_and_grid(
+            f"checkpoint-epoch{epoch + 1}/checkpoint-epoch{epoch + 1}"
+        )
 
 
 if __name__ == "__main__":
