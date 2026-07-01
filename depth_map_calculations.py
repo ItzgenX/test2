@@ -1,5 +1,5 @@
 """
-pre_depth_calculations.py
+depth_map_calculations.py
 -------------------
 Pre-compute and CACHE depth maps for training images using Intel DPT-Hybrid MiDaS.
 
@@ -24,15 +24,15 @@ JSON MANIFEST FORMAT:
 
 TYPICAL WORKFLOW (directory mode — recommended):
   # Step 1: compute depths for all images, auto-updates train/val/test.json
-  python precompute_depth.py --input_dir data/images --output_dir data/depths
+  python depth_map_calculations.py --input_dir data/images --output_dir data/depths
   # Scans data/images/, saves depth PNGs to data/depths/,
   # then finds data/train.json + data/test.json and fills "depth_path" fields.
 
   # Step 2: train
-  python train_depth.py experiment=train_depth_12gb
+  python depth_training.py experiment=train_depth_12gb
 
 ALTERNATIVE (JSON mode — when you already have a JSON file):
-  python precompute_depth.py --json_file data/train.json --output_dir data/depths
+  python depth_map_calculations.py --json_file data/train.json --output_dir data/depths
 """
 
 import argparse
@@ -145,7 +145,7 @@ def precompute_depths_from_paths(
     # THREE places and they MUST stay byte-for-byte identical, or training
     # data and live inference silently diverge:
     #   1. here (offline depth precompute, this file)
-    #   2. inference_depth.py        (live inference preprocess)
+    #   2. depth_inference.py        (live inference preprocess)
     #   3. configs/data/local_depth.yaml  (training-time RGB transform)
     # If you change one, change all three. Parity is verified by the Step-4
     # cross-stage check (float-vs-float diff must be 0.0).
@@ -217,9 +217,9 @@ def precompute_depths_from_paths(
     return path_to_depth
 
 
-def _verify_depth_training_json(json_path: Path) -> tuple[int, int]:
+def _verify_depth_training_jsonl(jsonl_path: Path) -> tuple[int, int]:
     """
-    Verify every entry in a depth-training output JSON.
+    Verify every entry in a depth-training output JSONL file.
 
     For each entry checks:
       1. All three required keys present: raw_image_path, depth_path, prompt.
@@ -232,8 +232,8 @@ def _verify_depth_training_json(json_path: Path) -> tuple[int, int]:
     """
     cwd = Path.cwd()
 
-    with open(json_path, "r", encoding="utf-8") as f:
-        entries = json.load(f)
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
 
     passed = failed = 0
     for i, entry in enumerate(entries):
@@ -266,9 +266,29 @@ def _verify_depth_training_json(json_path: Path) -> tuple[int, int]:
         passed += 1
 
     status = "PASS" if failed == 0 else "FAIL"
-    print(f"  [{status}] {json_path.name}: {passed}/{len(entries)} entries valid"
+    print(f"  [{status}] {jsonl_path.name}: {passed}/{len(entries)} entries valid"
           + (f", {failed} FAILED" if failed else ""))
     return passed, failed
+
+
+def _find_split_jsonl(data_dir: Path, split: str) -> Path | None:
+    """
+    Locate the JSONL file for a given split ("train", "val", or "test") in data_dir.
+
+    Search order:
+      1. Exact name: data_dir/{split}.jsonl
+      2. Any *.jsonl file whose stem contains the split name (case-insensitive).
+         If multiple match, pick the shortest name (most specific).
+    Returns the Path if found, else None.
+    """
+    exact = data_dir / f"{split}.jsonl"
+    if exact.exists():
+        return exact
+    candidates = sorted(
+        [p for p in data_dir.glob("*.jsonl") if split.lower() in p.stem.lower()],
+        key=lambda p: len(p.stem),
+    )
+    return candidates[0] if candidates else None
 
 
 def build_depth_training_jsons(
@@ -285,14 +305,14 @@ def build_depth_training_jsons(
     local_files_only: bool = False,
 ) -> None:
     """
-    Create depth_training/{train,val,test}.json from data/{train,val,test}.json.
+    Create depth_training/{train,val,test}.jsonl from data/{train,val,test}.jsonl.
 
-    For each source JSON this function:
+    For each source JSONL this function:
       1. Reads every entry's image path + prompt via _get_source_key() —
-         handles both the 'source' key (existing data/ JSONs) and the
+         handles both the 'source' key (existing data/ JSONLs) and the
          'raw_image_path' key (DepthJsonDataset format).
       2. Runs precompute_depths_from_paths() to compute (or look up cached)
-         depth PNGs for all images in that JSON.
+         depth PNGs for all images in that JSONL.
       3. In a SINGLE PASS over zip(source_entries, abs_image_paths), builds
          each output entry from its own source entry — never from a separately
          sorted list that could silently drift in index.  Each output entry
@@ -300,40 +320,42 @@ def build_depth_training_jsons(
            raw_image_path  — forward-slash relative path to the source image
            depth_path      — forward-slash relative path to the depth PNG
            prompt          — text caption, copied verbatim
-      4. Writes depth_training/<name>.json.
-      5. Calls _verify_depth_training_json() and prints PASS/FAIL.
+      4. Writes depth_training/<name>.jsonl (one JSON object per line).
+      5. Calls _verify_depth_training_jsonl() and prints PASS/FAIL.
 
     Args:
-        data_dir   : folder containing train.json / val.json / test.json
+        data_dir   : folder containing train.jsonl / val.jsonl / test.jsonl.
+                     Uses _find_split_jsonl() to discover files whose names may
+                     differ — any *.jsonl whose stem contains "train"/"val"/"test"
+                     is accepted if the exact default name is absent.
         raw_dir    : root of the raw image tree (data/raw/).
                      Used by _depth_out_path() to mirror the folder structure
                      into depth_dir (data/raw/000417/img.jpg ->
                      depth_dir/000417/img.png).
         depth_dir  : where depth PNGs are saved (data/raw_depth/).
-        output_dir : where the new three-field JSONs are written
-                     (default data/depth_training/ — kept under data/ alongside
-                     data/raw/ and data/raw_depth/).
-        subset_n   : if set, only process the first N entries per JSON —
+        output_dir : where the new three-field JSONLs are written
+                     (default data/depth_training/).
+        subset_n   : if set, only process the first N entries per JSONL —
                      use this for a dry run before committing to the full dataset.
     """
     cwd = Path.cwd()
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_dir_abs = raw_dir if raw_dir.is_absolute() else cwd / raw_dir
 
-    for json_name in ["train.json", "val.json", "test.json"]:
-        src_path = data_dir / json_name
-        if not src_path.exists():
-            print(f"\n[WARN] {src_path} not found — skipping.")
+    for split in ["train", "val", "test"]:
+        src_path = _find_split_jsonl(data_dir, split)
+        if src_path is None:
+            print(f"\n[WARN] No JSONL for split '{split}' found in {data_dir} — skipping.")
             continue
 
         with open(src_path, "r", encoding="utf-8") as f:
-            all_entries = json.load(f)
+            all_entries = [json.loads(line) for line in f if line.strip()]
 
         # Optionally slice to the first N for a dry run
         entries = all_entries[:subset_n] if subset_n else all_entries
 
         print(f"\n{'='*56}")
-        print(f"  {json_name}: processing {len(entries)} entries"
+        print(f"  {src_path.name}: processing {len(entries)} entries"
               + (f" (dry-run subset of {len(all_entries)} total)" if subset_n else ""))
         print(f"{'='*56}")
 
@@ -395,16 +417,17 @@ def build_depth_training_jsons(
                 "prompt":         entry["prompt"],
             })
 
-        # ---- Step 4: write output JSON ------------------------------------- #
-        out_path = output_dir / json_name
+        # ---- Step 4: write output JSONL (one object per line) ------------- #
+        out_path = output_dir / f"{split}.jsonl"
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(out_entries, f, indent=2, ensure_ascii=False)
+            for entry in out_entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         skip_note = f"  ({n_skipped} skipped due to depth errors)" if n_skipped else ""
         print(f"\n  Written {len(out_entries)} entries -> {out_path}{skip_note}")
 
         # ---- Step 5: verify every entry ------------------------------------ #
-        _verify_depth_training_json(out_path)
+        _verify_depth_training_jsonl(out_path)
 
 
 def run_json_mode(args):
@@ -421,7 +444,7 @@ def run_json_mode(args):
         return
 
     with open(json_path, "r", encoding="utf-8") as f:
-        entries = json.load(f)
+        entries = [json.loads(line) for line in f if line.strip()]
 
     print(f"Loaded {len(entries)} entries from: {json_path}")
 
@@ -467,14 +490,15 @@ def run_json_mode(args):
         elif "depth_path" not in entry:
             print(f"[WARN] No depth for: {img_path}")
 
-    # Write updated JSON
+    # Write updated JSONL (one object per line)
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2, ensure_ascii=False)
+        for entry in entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     print(f"Updated {updated}/{len(entries)} entries with depth paths.")
-    print(f"Saved updated JSON → {json_path}")
+    print(f"Saved updated JSONL -> {json_path}")
     print("\nNext step:")
-    print(f"  python train_depth.py experiment=train_depth_12gb data.json_file={json_path}")
+    print(f"  python depth_training.py experiment=train_depth data.json_file={json_path}")
 
 
 def update_json_files(json_dir: Path, path_to_depth_rel: dict, input_dir: Path = None) -> None:
@@ -490,21 +514,18 @@ def update_json_files(json_dir: Path, path_to_depth_rel: dict, input_dir: Path =
         input_dir         : absolute path to the image root used during precompute.
                             Required for correct matching with nested folder layouts.
     """
-    json_files = sorted(json_dir.glob("*.json"))
+    json_files = sorted(json_dir.glob("*.jsonl"))
     if not json_files:
-        print(f"  No JSON files found in: {json_dir}")
+        print(f"  No JSONL files found in: {json_dir}")
         return
 
     for json_path in json_files:
         try:
             with open(json_path, "r", encoding="utf-8") as f:
-                entries = json.load(f)
+                entries = [json.loads(line) for line in f if line.strip()]
         except Exception as e:
             print(f"  [WARN] Could not read {json_path.name}: {e}")
             continue
-
-        if not isinstance(entries, list):
-            continue   # not a manifest file, skip
 
         updated = 0
         for entry in entries:
@@ -536,7 +557,8 @@ def update_json_files(json_dir: Path, path_to_depth_rel: dict, input_dir: Path =
 
         if updated > 0:
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(entries, f, indent=2, ensure_ascii=False)
+                for entry in entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             print(f"  Updated {updated}/{len(entries)} entries in {json_path.name}")
         else:
             print(f"  No matching images found in {json_path.name} (skipped)")
@@ -608,7 +630,7 @@ def run_directory_mode(args):
     update_json_files(json_dir, path_to_depth_rel, input_dir)
 
     print("\nNext step — train:")
-    print("  python train_depth.py experiment=train_depth_12gb")
+    print("  python depth_training.py experiment=train_depth_12gb")
 
 
 def main():
@@ -631,10 +653,11 @@ def main():
     # ---- Depth-training JSON mode (new — creates depth_training/*.json) --- #
     parser.add_argument(
         "--data_dir", type=str, default=None,
-        help="Folder containing train.json / val.json / test.json (e.g. data/). "
-             "When given, activates 'depth-training JSON mode': computes depth maps "
-             "and writes depth_training/{train,val,test}.json with raw_image_path + "
-             "depth_path + prompt fields. Cannot be combined with --input_dir.",
+        help="Folder containing train.jsonl / val.jsonl / test.jsonl (e.g. data/). "
+             "Any *.jsonl whose stem contains 'train'/'val'/'test' is accepted if the "
+             "exact default name is absent. Activates depth-training JSONL mode: "
+             "computes depth maps and writes depth_training/{train,val,test}.jsonl. "
+             "Cannot be combined with --input_dir.",
     )
     parser.add_argument(
         "--raw_dir", type=str, default=None,
@@ -660,7 +683,7 @@ def main():
     )
     parser.add_argument(
         "--json_dir", type=str, default=None,
-        help="(Optional) Folder to scan for *.json files to update after computing depths. "
+        help="(Optional) Folder to scan for *.jsonl files to update after computing depths. "
              "Defaults to the parent of --input_dir (e.g. data/).",
     )
 
@@ -699,9 +722,9 @@ def main():
     if not args.data_dir and not args.input_dir and not args.json_file:
         parser.error(
             "Provide one of:\n"
-            "  --data_dir data/            (recommended — builds depth_training/*.json)\n"
-            "  --input_dir data/raw        (directory mode)\n"
-            "  --json_file data/train.json (single-JSON mode)"
+            "  --data_dir data/              (recommended — builds depth_training/*.jsonl)\n"
+            "  --input_dir data/raw          (directory mode)\n"
+            "  --json_file data/train.jsonl  (single-JSONL mode)"
         )
 
     if args.data_dir and args.input_dir:

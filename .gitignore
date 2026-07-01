@@ -9,5 +9,6 @@ ignore
 *__pycache__/
 
 /data/
+/.claude/
 
 docs_word/

@@ -1,53 +1,52 @@
 """
-inference_depth.py
-------------------
-Run inference with a trained depth-conditioned LoRAdapter.
+seg_inference.py
+----------------
+Run inference with a trained segmentation-conditioned LoRAdapter.
 
 This script:
   1. Loads the SD 1.5 base model + trained LoRA/mapper from a checkpoint.
-  2. For each input image, runs the DepthEstimator (Intel DPT-Hybrid-MiDaS)
-     to get a depth map, then generates a new image conditioned on that depth.
-  3. Saves a 4-panel grid (ORIGINAL | DEPTH MAP | PREDICTED | RAW DEPTH GEN) per
-     image so you can visually evaluate quality and pick the best checkpoint.
+  2. For each input image, runs the SegmentationEncoder (SegFormer-b5-Cityscapes)
+     to get a colourised seg map, then generates a new image conditioned on that map.
+  3. Saves a 4-panel grid (ORIGINAL | SEG MAP | PREDICTED | RAW SEG GEN) per image
+     so you can visually evaluate quality and pick the best checkpoint.
+
+This is the segmentation twin of depth_inference.py. It mirrors that script's
+structure exactly, with three seg-specific differences:
+  1. `_seg_label_bar` / `make_seg_inference_grid` — seg-prefixed, "SEG MAP" label.
+  2. model loading reads `cfg.seg_model_name/seg_model_path` (not depth_*).
+  3. Preprocessing via `build_seg_square_preprocess()` from src/data/transforms.py
+     — the SAME function seg_map_calculations.py uses — so the live seg map
+     is byte-identical to what the model trained on (train/inference parity).
 
 INPUT OPTIONS:
-  a) JSON manifest file (recommended) — each entry has "image" + "prompt":
-       inference.json_file=dataset.json
+  a) JSON manifest file (recommended) — each entry has "raw_image_path" + "prompt":
+       inference.json_file=data/seg_training/test.jsonl
   b) Direct list of image paths:
-       "inference.images=[data/cat.jpg,data/dog.jpg]"
-       "inference.prompts=['a cat','a dog']"
+       "inference.images=[data/raw/000417/raw_image.jpg]"
+       "inference.prompts=['urban driving scene, clear weather']"
 
 OUTPUT MODES:
-
   Default (save_generated_only=false) — saves 4 files per image:
-    cat_grid.jpg        ← 4 panels side by side: ORIGINAL | DEPTH MAP | PREDICTED | RAW DEPTH GEN
-    cat_original.jpg    ← the input image rescaled
-    cat_depth.jpg       ← the depth map computed by DPT
-    cat_predicted.jpg   ← the generated image
+    raw_image_grid.jpg         ← 4 panels: ORIGINAL | SEG MAP | PREDICTED | RAW SEG GEN
+    raw_image_original.jpg     ← input image rescaled
+    raw_image_seg.jpg          ← the seg colour map from SegFormer-b5
+    raw_image_predicted.jpg    ← the generated image
 
   Batch eval (save_generated_only=true, json_file required):
-    Saves ONLY the generated image, mirroring the folder structure from the JSON.
-    Example: raw_image_path="data/images/dog.jpg" → output_dir/data/images/dog.jpg
-    Use this after training to evaluate test.json with a clean folder of results.
+    Saves ONLY the generated image, mirroring folder structure from the JSON.
 
 USAGE:
   # Standard single/multi image inference:
-  python inference_depth.py \\
-      ckpt_path=outputs/train/runs/2024-01-01/00-00-00/checkpoint-3000 \\
-      inference.json_file=dataset.json \\
-      inference.output_dir=results
+  python seg_inference.py \\
+      ckpt_path=outputs/train/seg/runs/2024-01-01/00-00-00/checkpoint-3000 \\
+      inference.json_file=data/seg_training/test.jsonl \\
+      inference.output_dir=results/seg
 
-  # Batch evaluate test.json — only generated images, mirrored folder structure:
-  python inference_depth.py \\
-      ckpt_path=outputs/train/runs/2024-01-01/00-00-00/checkpoint-3000 \\
-      inference.json_file=data/test.json \\
-      inference.output_dir=results/test_eval \\
-      inference.save_generated_only=true
-
-  python inference_depth.py \\
-      ckpt_path=outputs/train/runs/2024-01-01/00-00-00/checkpoint-3000 \\
-      "inference.images=[data/cat.jpg]" \\
-      "inference.prompts=['a realistic photo of a cat']"
+  # Direct image:
+  python seg_inference.py \\
+      ckpt_path=outputs/train/seg/runs/2024-01-01/00-00-00/checkpoint-3000 \\
+      "inference.images=[data/raw/000417/raw_image.jpg]" \\
+      "inference.prompts=['driving in rain at night']"
 """
 
 import hydra
@@ -59,12 +58,11 @@ from PIL import Image, ImageDraw
 import torchvision.transforms.functional as TF
 from pathlib import Path
 from tqdm import tqdm
-from torchvision import transforms
 
 from hydra.utils import get_original_cwd
 from src.model import ModelBase
 from src.utils import add_lora_from_config
-from src.data.transforms import SquarePad
+from src.data.transforms import build_seg_square_preprocess
 
 torch.set_float32_matmul_precision("high")
 
@@ -73,8 +71,12 @@ torch.set_float32_matmul_precision("high")
 #  VISUALIZATION HELPERS                                                  #
 # ===================================================================== #
 
-def _label_bar(width: int, text: str, bar_h: int = 28) -> np.ndarray:
-    """Dark banner bar with centered text. Returns [bar_h, width, 3] uint8."""
+def _seg_label_bar(width: int, text: str, bar_h: int = 28) -> np.ndarray:
+    """
+    Dark banner bar with centered text. Returns [bar_h, width, 3] uint8.
+    The 'seg_' prefix marks this as segmentation-pipeline code.
+    Mirrors depth_inference.py's _label_bar with identical implementation.
+    """
     bar  = Image.new("RGB", (width, bar_h), color=(25, 25, 25))
     draw = ImageDraw.Draw(bar)
     bbox = draw.textbbox((0, 0), text)
@@ -83,9 +85,9 @@ def _label_bar(width: int, text: str, bar_h: int = 28) -> np.ndarray:
     return np.asarray(bar)
 
 
-def make_inference_grid(
+def make_seg_inference_grid(
     orig_pil:     Image.Image,
-    depth_pil:    Image.Image,
+    seg_pil:      Image.Image,
     pred_pil:     Image.Image,
     raw_pred_pil: Image.Image,
     size: int,
@@ -93,31 +95,34 @@ def make_inference_grid(
     """
     Create a single image with 4 panels SIDE BY SIDE:
 
-        ┌──────────┬──────────┬──────────┬──────────────┐
-        │ ORIGINAL │DEPTH MAP │PREDICTED │RAW DEPTH GEN │  ← label bars (28 px)
-        ├──────────┼──────────┼──────────┼──────────────┤
-        │          │          │          │              │
-        │  size×   │  size×   │  size×   │   size×      │  ← image panels
-        │  size    │  size    │  size    │   size       │
-        └──────────┴──────────┴──────────┴──────────────┘
+        ┌──────────┬──────────┬──────────┬─────────────┐
+        │ ORIGINAL │  SEG MAP │PREDICTED │ RAW SEG GEN │  ← label bars (28 px)
+        ├──────────┼──────────┼──────────┼─────────────┤
+        │          │          │          │             │
+        │  size×   │  size×   │  size×   │   size×     │  ← image panels
+        │  size    │  size    │  size    │   size      │
+        └──────────┴──────────┴──────────┴─────────────┘
 
-    RAW DEPTH GEN: same depth conditioning but empty prompt — shows pure
-    depth adherence with no text influence. Matches training validation grid.
+    RAW SEG GEN: same seg conditioning but empty prompt — shows pure
+    segmentation adherence with no text influence. Mirrors training val grid.
     Total image: (4*size) wide, (size + 28) tall.
+
+    The 'seg_' prefix marks this as segmentation-pipeline code. Mirrors
+    depth_inference.py's make_inference_grid, with "SEG MAP"/"RAW SEG GEN".
     """
     orig     = orig_pil.resize((size, size)).convert("RGB")
-    depth    = depth_pil.resize((size, size)).convert("RGB")
+    seg      = seg_pil.resize((size, size)).convert("RGB")
     pred     = pred_pil.resize((size, size)).convert("RGB")
     raw_pred = raw_pred_pil.resize((size, size)).convert("RGB")
 
-    imgs_row  = np.concatenate([np.asarray(orig), np.asarray(depth),
+    imgs_row  = np.concatenate([np.asarray(orig), np.asarray(seg),
                                  np.asarray(pred), np.asarray(raw_pred)], axis=1)
 
     label_row = np.concatenate([
-        _label_bar(size, "ORIGINAL"),
-        _label_bar(size, "DEPTH MAP"),
-        _label_bar(size, "PREDICTED"),
-        _label_bar(size, "RAW DEPTH GEN"),
+        _seg_label_bar(size, "ORIGINAL"),
+        _seg_label_bar(size, "SEG MAP"),
+        _seg_label_bar(size, "PREDICTED"),
+        _seg_label_bar(size, "RAW SEG GEN"),
     ], axis=1)
 
     grid = np.concatenate([label_row, imgs_row], axis=0)
@@ -128,15 +133,18 @@ def make_inference_grid(
 #  MAIN                                                                   #
 # ===================================================================== #
 
-@hydra.main(config_path="configs", config_name="inference_depth")
+@hydra.main(config_path="configs", config_name="inference_seg")
 def main(cfg):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    output_dir = Path(cfg.inference.output_dir)
+    # Resolve output_dir from the original repo root (not Hydra's run dir).
+    _root = get_original_cwd()
+    _out = Path(cfg.inference.output_dir)
+    output_dir = _out if _out.is_absolute() else Path(_root) / _out
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"  inference_depth.py")
+    print(f"  seg_inference.py")
     print(f"  Device     : {device}")
     print(f"  Output dir : {output_dir}")
     print(f"{'='*60}\n")
@@ -145,17 +153,16 @@ def main(cfg):
     # Same logic as training, so inference uses the SAME model (parity rule).
     # Local paths are made absolute from the repo root; when offline we also
     # export HF_HUB_OFFLINE so nothing can touch the network.
-    _root = get_original_cwd()
     if cfg.local_files_only:
-        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"]      = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         cfg.model.model_name          = os.path.join(_root, cfg.base_model_path)
-        cfg.lora.struct.encoder.model = os.path.join(_root, cfg.depth_model_path)
+        cfg.lora.struct.encoder.model = os.path.join(_root, cfg.seg_model_path)
     else:
         cfg.model.model_name          = cfg.base_model_name
-        cfg.lora.struct.encoder.model = cfg.depth_model_name
-    print(f"[model] base  = {cfg.model.model_name}")
-    print(f"[model] depth = {cfg.lora.struct.encoder.model}")
+        cfg.lora.struct.encoder.model = cfg.seg_model_name
+    print(f"[model] base = {cfg.model.model_name}")
+    print(f"[model] seg  = {cfg.lora.struct.encoder.model}")
     print(f"[model] local_files_only = {cfg.local_files_only}")
 
     # ------------------------------------------------------------------ #
@@ -190,7 +197,7 @@ def main(cfg):
         if not json_path.is_absolute():
             json_path = Path.cwd() / json_path
         with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            data = [json.loads(line) for line in f if line.strip()]
         for item in data:
             entries.append({
                 "image_path": item["raw_image_path"],
@@ -210,28 +217,25 @@ def main(cfg):
 
     if not entries:
         print("[ERROR] No input images provided.")
-        print("  Set inference.json_file=dataset.json")
-        print("  or  \"inference.images=[data/img.jpg]\"")
+        print("  Set inference.json_file=data/seg_training/test.jsonl")
+        print("  or  \"inference.images=[data/raw/000417/raw_image.jpg]\"")
         return
 
     # ------------------------------------------------------------------ #
-    # Image preprocessing — resize_mode: letterbox.  SquarePad pads the    #
-    # shorter side with edge-replication so the image is square BEFORE      #
-    # Resize; this prevents the encoder's internal better_resize() from     #
-    # silently center-cropping the frame (references.md §5).                #
+    # Image preprocessing — SHARED function (train/inference parity).      #
+    # build_seg_square_preprocess() from src/data/transforms.py is the     #
+    # SINGLE SOURCE OF TRUTH for segmentation squaring. Using it here is   #
+    # what guarantees the live seg map matches the saved training map:      #
+    #   seg_map_calculations.py -> build_seg_square_preprocess()     #
+    #   seg_inference.py              -> build_seg_square_preprocess()      #
+    # Any change to the preprocessing function propagates to both stages    #
+    # automatically. (This is the same principle depth uses via SquarePad, #
+    # but consolidated into one shared factory function.)                   #
     # Output: [1, 3, H, W] in [-1, 1].                                      #
-    #                                                                       #
-    # PARITY-CRITICAL: byte-for-byte identical to (1) pre_depth_calculations#
-    # .py and (2) configs/data/local_depth.yaml.  Changing one without the  #
-    # others makes live inference diverge from the saved training depth.    #
     # ------------------------------------------------------------------ #
-    size = cfg.size
-    preprocess = transforms.Compose([
-        SquarePad(),                                       # shorter side → square (edge-replicated)
-        transforms.Resize((size, size)),                   # square → size × size
-        transforms.ToTensor(),                             # [0,255] → [0,1]
-        transforms.Normalize(mean=[0.5]*3, std=[0.5]*3),  # [0,1] → [-1,1]
-    ])
+    size        = cfg.size
+    resize_mode = cfg.inference.get("resize_mode", "letterbox")
+    preprocess  = build_seg_square_preprocess(size=size, resize_mode=resize_mode)
 
     generator = torch.Generator(device=device).manual_seed(cfg.seed)
 
@@ -241,7 +245,7 @@ def main(cfg):
     for entry in tqdm(entries, desc="Generating"):
         img_path = Path(entry["image_path"])
         if not img_path.is_absolute():
-            img_path = Path.cwd() / img_path
+            img_path = Path(_root) / img_path   # _root = original cwd (repo root)
         prompt = entry["prompt"]
         stem   = img_path.stem
 
@@ -252,22 +256,22 @@ def main(cfg):
         print(f"\n  Image : {img_path.name}")
         print(f"  Prompt: {prompt!r}")
 
-        # Load and preprocess to [-1, 1] tensor
+        # Load and preprocess to [-1, 1] tensor.
         orig_pil   = Image.open(img_path).convert("RGB")
         img_tensor = preprocess(orig_pil).unsqueeze(0).to(device)   # [1, 3, H, W]
 
         with torch.no_grad():
 
-            # ---- Step 1: Depth map for visualization ----
-            # model.encoders[0] is DepthEstimator (Intel DPT-Hybrid-MiDaS).
-            # Input: [-1, 1]  Output: [0, 1] 3-channel (all channels identical)
-            depth_tensor = model.encoders[0](img_tensor)   # [1, 3, H, W] in [0,1]
-            depth_pil    = TF.to_pil_image(depth_tensor[0].cpu().float().clamp(0, 1))
+            # ---- Step 1: Seg colour map for visualization ----
+            # model.encoders[0] is SegmentationEncoder (SegFormer-b5-Cityscapes).
+            # Input: [-1, 1]  Output: [0, 1] 3-channel colour map.
+            seg_tensor = model.encoders[0](img_tensor)   # [1, 3, H, W] in [0,1]
+            seg_pil    = TF.to_pil_image(seg_tensor[0].cpu().float().clamp(0, 1))
 
             # ---- Step 2: Generate image (prompt-conditioned) ----
             # cs=[img_tensor]: sample_easy() calls encoder(c) unconditionally,
-            # so DPT runs on img_tensor again to produce the conditioning for the mapper.
-            # depth_tensor above is only for visualization — it is the same result.
+            # so SegFormer runs on img_tensor again to produce the conditioning.
+            # seg_tensor above is only for visualization — same result.
             preds = model.sample(
                 prompt=[prompt],
                 num_images_per_prompt=cfg.inference.n_samples,
@@ -278,9 +282,9 @@ def main(cfg):
                 guidance_scale=cfg.inference.get("guidance_scale", 7.5),
             )
 
-            # ---- Step 2b: RAW DEPTH GEN (empty prompt) ----
-            # Same depth conditioning, empty text — shows pure depth adherence
-            # with zero text influence. Matches the 4th row of the training grid.
+            # ---- Step 2b: RAW SEG GEN (empty prompt) ----
+            # Same seg conditioning, empty text — shows pure segmentation adherence
+            # with no text influence. Matches the 4th panel of the training grid.
             raw_preds = model.sample(
                 prompt=[""],
                 num_images_per_prompt=cfg.inference.n_samples,
@@ -301,30 +305,28 @@ def main(cfg):
 
             if save_generated_only:
                 # Mirror the exact path from the JSON so folder structure is preserved.
-                # e.g. raw_image_path="data/images/dog.jpg" →
-                #      output_dir/data/images/dog.jpg  (or dog_1.jpg for n_samples>1)
                 rel = Path(entry["image_path"])
                 out_path = output_dir / rel.parent / f"{rel.stem}{suffix}{rel.suffix}"
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 pred_pil.resize((size, size)).save(out_path, quality=95)
                 print(f"  -> {out_path}")
             else:
-                # Full debug output: 4-panel grid + individual panels
-                grid = make_inference_grid(orig_display, depth_pil, pred_pil, raw_pred_pil, size)
+                # Full debug output: 4-panel grid + individual panels.
+                grid = make_seg_inference_grid(orig_display, seg_pil, pred_pil, raw_pred_pil, size)
                 grid_path = output_dir / f"{stem}{suffix}_grid.jpg"
                 grid.save(grid_path, quality=95)
 
                 orig_display.resize((size, size)).save(
                     output_dir / f"{stem}_original.jpg"
                 )
-                depth_pil.resize((size, size)).convert("RGB").save(
-                    output_dir / f"{stem}_depth.jpg"
+                seg_pil.resize((size, size)).convert("RGB").save(
+                    output_dir / f"{stem}_seg.jpg"
                 )
                 pred_pil.resize((size, size)).save(
                     output_dir / f"{stem}{suffix}_predicted.jpg", quality=95
                 )
                 raw_pred_pil.resize((size, size)).save(
-                    output_dir / f"{stem}{suffix}_raw_depth_gen.jpg", quality=95
+                    output_dir / f"{stem}{suffix}_raw_seg_gen.jpg", quality=95
                 )
                 print(f"  -> {grid_path}")
 

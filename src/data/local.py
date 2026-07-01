@@ -202,7 +202,7 @@ class DepthImageFolderDataset(Dataset):
             print(
                 f"[DepthImageFolderDataset] WARNING: {len(missing)} depth maps missing "
                 f"in {depth_directory}.\n"
-                f"  Run:  python precompute_depth.py "
+                f"  Run:  python depth_map_calculations.py "
                 f"--input_dir {image_directory} --output_dir {depth_directory}\n"
                 f"  First missing: {missing[:5]}"
             )
@@ -247,7 +247,7 @@ class DepthImageDataModule:
 
     Wraps one or more DepthImageFolderDataset instances (one per image/depth
     directory pair) and exposes the standard train_dataloader / val_dataloader
-    interface used by train_depth.py.
+    interface used by depth_training.py.
 
     USAGE IN CONFIG (configs/data/local_depth.yaml):
         _target_: src.data.local.DepthImageDataModule
@@ -355,15 +355,10 @@ class DepthJsonDataset(Dataset):
     """
     Loads image + pre-computed depth map pairs described in a JSON manifest.
 
-    JSON MANIFEST FORMAT (one list, each entry is one training sample):
-        [
-          {
-            "raw_image_path": "data/images/cat.jpg",       <- path to RGB image
-            "prompt":         "a cute cat on a chair",     <- text prompt for this image
-            "depth_path":     "data/depths/cat.png"        <- depth PNG (added by precompute_depth.py)
-          },
-          ...
-        ]
+    JSONL MANIFEST FORMAT (one JSON object per line, each entry is one training sample):
+        {"raw_image_path": "data/images/cat.jpg", "prompt": "a cute cat on a chair", "depth_path": "data/depths/cat.png"}
+        {"raw_image_path": "data/images/dog.jpg", "prompt": "a dog in the park",     "depth_path": "data/depths/dog.png"}
+        ...
 
     Paths can be:
       - Absolute  â†’ used as-is
@@ -384,13 +379,15 @@ class DepthJsonDataset(Dataset):
         image_transform,         # torchvision Compose for RGB images
         depth_size: int = 512,
         project_root: Path = None,
+        image_root: Path = None,
     ):
         self.json_file   = Path(json_file)
         self.json_dir    = self.json_file.parent
         self.project_root = Path(project_root) if project_root else self.json_dir
+        self.image_root  = Path(image_root) if image_root else None
 
         with open(self.json_file, "r", encoding="utf-8") as f:
-            self.items = json.load(f)
+            self.items = [json.loads(line) for line in f if line.strip()]
 
         self.image_transform = image_transform
 
@@ -399,7 +396,7 @@ class DepthJsonDataset(Dataset):
         #
         # PARITY-CRITICAL — why there is NO SquarePad here (and why that is correct):
         #   The depth PNG was ALREADY produced from a letterboxed square in
-        #   pre_depth_calculations.py (SquarePad -> Resize(size) -> DPT -> save).
+        #   depth_map_calculations.py (SquarePad -> Resize(size) -> DPT -> save).
         #   So the PNG on disk is already a `depth_size`-square that is pixel-
         #   aligned with the letterboxed RGB image.  Resize((depth_size,depth_size))
         #   is therefore a no-op alignment step, NOT a stretch.
@@ -424,7 +421,7 @@ class DepthJsonDataset(Dataset):
         if missing_dep > 0:
             print(
                 f"[DepthJsonDataset] {missing_dep}/{len(self.items)} entries missing depth_path.\n"
-                f"  Run: python precompute_depth.py --input_dir data/images --output_dir data/depths"
+                f"  Run: python depth_map_calculations.py --input_dir data/images --output_dir data/depths"
             )
 
     def _resolve(self, p: str) -> Path:
@@ -432,6 +429,10 @@ class DepthJsonDataset(Dataset):
         p = Path(p)
         if p.is_absolute():
             return p
+        if self.image_root:
+            abs_p = self.image_root / p
+            if abs_p.exists():
+                return abs_p
         abs_p = self.project_root / p
         if abs_p.exists():
             return abs_p
@@ -461,7 +462,7 @@ class DepthJsonDataset(Dataset):
         if "depth_path" not in item:
             raise KeyError(
                 f"Entry {idx} in {self.json_file.name} has no 'depth_path'. "
-                f"Run pre_depth_calculations.py to build the depth_training JSONs first."
+                f"Run depth_map_calculations.py to build the depth_training JSONs first."
             )
         depth_path = self._resolve(item["depth_path"])
         depth = Image.open(depth_path).convert("L")   # "L" = 8-bit grayscale
@@ -477,7 +478,7 @@ class DepthJsonDataModule:
 
     Use this when you have per-image prompts stored in a JSON file.
     Pairs with DepthJsonDataset and exposes the standard
-    train_dataloader() / val_dataloader() interface expected by train_depth.py.
+    train_dataloader() / val_dataloader() interface expected by depth_training.py.
 
     CONFIG EXAMPLE (configs/data/local_depth_json.yaml):
         _target_: src.data.local.DepthJsonDataModule
@@ -487,7 +488,7 @@ class DepthJsonDataModule:
         batch_size: 8
 
     COMMAND-LINE OVERRIDE:
-        python train_depth.py ... data.json_file=my_dataset.json
+        python depth_training.py ... data.json_file=my_dataset.json
     """
 
     def __init__(
@@ -500,9 +501,11 @@ class DepthJsonDataModule:
         val_batch_size: int = 1,
         workers: int = 4,
         val_workers: int = 1,
+        image_root: str = None,
     ):
         project_root = Path(os.path.abspath(__file__)).parent.parent.parent
         image_tfm    = transforms.Compose(transform)
+        _img_root    = Path(project_root, image_root) if image_root else project_root
 
         self.batch_size     = batch_size
         self.val_batch_size = val_batch_size
@@ -513,7 +516,7 @@ class DepthJsonDataModule:
             json_file=Path(project_root, json_file),
             image_transform=image_tfm,
             depth_size=size,
-            project_root=project_root,
+            project_root=_img_root,
         )
 
         if val_json_file:
@@ -521,7 +524,7 @@ class DepthJsonDataModule:
                 json_file=Path(project_root, val_json_file),
                 image_transform=image_tfm,
                 depth_size=size,
-                project_root=project_root,
+                project_root=_img_root,
             )
         else:
             # No separate val set â†’ reuse training set (common for small datasets)

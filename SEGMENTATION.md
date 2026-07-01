@@ -19,9 +19,9 @@ Why segmentation as a conditioning signal?
 
 | Stage | File | When |
 |-------|------|------|
-| C — offline preprocessing | `calculate_segmentation_map.py` | **Once**, before any training |
-| D — training | `train_seg.py` | Iterative; resumes from checkpoint |
-| D — inference | `inference_seg.py` | After training; per-image generation |
+| C — offline preprocessing | `seg_map_calculations.py` | **Once**, before any training |
+| D — training | `seg_training.py` | Iterative; resumes from checkpoint |
+| D — inference | `seg_inference.py` | After training; per-image generation |
 
 Supporting files:
 
@@ -44,10 +44,10 @@ Supporting files:
 RAW IMAGE (arbitrary aspect ratio)
         |
         v
-  [Stage C -- calculate_segmentation_map.py]  (run ONCE offline)
+  [Stage C -- seg_map_calculations.py]  (run ONCE offline)
         |
         +-- build_seg_square_preprocess(size=512, resize_mode="letterbox")
-        |     (same factory used by inference_seg.py -- parity guaranteed)
+        |     (same factory used by seg_inference.py -- parity guaranteed)
         +-- SegmentationEncoder.label_ids(tensor)
         |     (SegFormer-b5 prediction --> raw class IDs [0..18])
         +-- Save as 8-bit grayscale PNG (mode "L", values 0..18)
@@ -57,7 +57,7 @@ RAW IMAGE (arbitrary aspect ratio)
 
         |
         v
-  [Stage D -- train_seg.py]  (per training step)
+  [Stage D -- seg_training.py]  (per training step)
         |
         +-- SegJsonDataset.__getitem__:
         |     read seg PNG (L mode) --> NEAREST resize --> seg_colorize_ids() with palette
@@ -73,7 +73,7 @@ RAW IMAGE (arbitrary aspect ratio)
 
         |
         v
-  [Stage D -- inference_seg.py]
+  [Stage D -- seg_inference.py]
         |
         +-- build_seg_square_preprocess(size=512, resize_mode="letterbox")
         |   (SAME factory function as Stage C -- parity by construction)
@@ -98,6 +98,134 @@ Key behaviours:
 - **Output of `label_ids()`**: raw class IDs `[B, H, W]` int64 — used ONLY by the offline calc script.
 - **Output of `forward()`**: colour map `[B, 3, H, W]` float `[0, 1]` — used at live inference.
 - **Parity guarantee**: both `label_ids()` and `forward()` share the same `_predict_ids()` internals. Only the final step differs (IDs vs colour lookup). Running `label_ids()` then `seg_colorize_ids()` on the saved PNG produces bit-identical output to calling `forward()` live.
+
+### 4.1 Q&A — Can MiDaS be reused for segmentation instead of SegFormer?
+
+**Q: We already have a MiDaS encoder for depth. Can we swap it into the segmentation pipeline instead of building/using SegFormer? Would it work?**
+
+**A: No — not "works worse," it cannot work at all. This is an architecture mismatch, not a quality tradeoff.**
+
+MiDaS is a **regression** model: its DPT decoder predicts one continuous depth value per pixel ("how far away is this point"), which `src/annotators/midas.py` min-max normalises to `[0,1]` and replicates across 3 channels. There is no class information anywhere in its weights or output — it was never trained to distinguish "this pixel is a pedestrian" from "this pixel is a building," only "near" from "far."
+
+Segmentation needs a **classifier**: a per-pixel probability distribution over the 19 Cityscapes classes, with the highest-probability class picked as the label. SegFormer's decode head does exactly this; MiDaS's does not and cannot, regardless of which checkpoint is loaded.
+
+Concretely, if MiDaS were forced into the seg encoder slot:
+- Output would still be `[B, 1, H, W]` continuous depth in `[0,1]`, replicated to 3 channels — not class IDs.
+- Colourising that with `SEG_CITYSCAPES_PALETTE` would produce "near = shade A, far = shade B" gradients, not road/car/person/sky regions.
+- The LoRA mapper would learn a depth-shaped conditioning signal mislabelled as segmentation — zero semantic content, not noisy semantic content.
+
+This is why `SegmentationEncoder` (`src/encoders/seg_encoder.py`) had to be built as a brand-new class rather than just pointing the existing `midas` encoder slot at a different model file — see §4 above and the encoder-slot-contract comment at the top of that file for how it satisfies the same input/output shape contract while doing fundamentally different (classification, not regression) work internally.
+
+---
+
+### 4.2 Q&A — Do we use `SegformerFeatureExtractor`? Did we write our own?
+
+**Q: The HuggingFace example uses two objects — `SegformerFeatureExtractor` and `SegformerForSemanticSegmentation`. Do we use both?**
+
+**A: We use `SegformerForSemanticSegmentation` (the model). We do NOT use `SegformerFeatureExtractor`. We wrote our own preprocessing that replaces it — three lines instead of one function call, with two deliberate differences.**
+
+#### What the HuggingFace example does
+
+```python
+# Step 1 — feature extractor = preprocessing wrapper
+feature_extractor = SegformerFeatureExtractor.from_pretrained("nvidia/segformer-b5-...")
+# Internally: resize to 1024x1024, convert [0,255] -> [0,1], apply ImageNet mean/std
+
+# Step 2 — the actual model
+model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b5-...")
+# Takes pixel_values -> logits [B, 19, H/4, W/4]
+```
+
+#### What our encoder does (from `src/encoders/seg_encoder.py:213-298`)
+
+```python
+# __init__: we load the MODEL only — no SegformerFeatureExtractor
+from transformers import SegformerForSemanticSegmentation   # imported
+# SegformerFeatureExtractor / SegformerImageProcessor       # NOT imported
+
+self.seg_model = SegformerForSemanticSegmentation.from_pretrained(
+    model, local_files_only=local_files_only
+)
+
+# _predict_ids(): we do the feature extractor's job manually
+x = (imgs + 1.0) / 2.0                               # our [-1,1] -> [0,1]
+x = F.interpolate(x, size=(512, 512), mode="bilinear")  # resize to OUR size, not 1024
+x = (x - self._seg_mean) / self._seg_std             # ImageNet normalize (buffers, on GPU)
+logits = self.seg_model(pixel_values=x).logits        # same as the HF example from here
+logits = F.interpolate(logits, size=(512, 512))       # upsample logits
+ids    = logits.argmax(dim=1)                         # class IDs [B, 512, 512]
+```
+
+So yes — `_predict_ids()` IS our own implementation of `SegformerFeatureExtractor`. It does the same three operations (range convert, resize, normalize) with two intentional differences:
+
+| | `SegformerFeatureExtractor` | Our `_predict_ids()` |
+|---|---|---|
+| Input range | `[0, 255]` uint8 or `[0, 1]` float | `[-1, 1]` (our pipeline's training format) |
+| Resize target | `1024 × 1024` (checkpoint's training size) | `512 × 512` (our pipeline's size) |
+| Normalization | ImageNet mean/std | Same values, as GPU buffers |
+| Output | `{"pixel_values": tensor}` dict | tensor directly |
+| Numerical match | — | **2.4e-7** absolute diff (verified, documented in file header) |
+
+#### Why resize to 512 instead of 1024
+
+SegFormer's encoder uses overlapping patch embeddings with a /4 stride — it can accept any spatial size that is a multiple of 4. 512 is valid. The accuracy drop vs 1024 is small for driving scenes; the benefit is that Stage C (`seg_map_calculations.py`) and live inference use the **same code path at the same resolution**, so the training maps and inference maps are pixel-identical rather than differing by an extra resize step.
+
+---
+
+### 4.3 Proof — MiDaS encoder also skips its feature extractor (verified against original repo)
+
+**Verified by fetching `https://github.com/CompVis/LoRAdapter` directly (2026-07-01).**
+
+Three facts confirmed from the original CompVis/LoRAdapter repository and paper:
+
+1. **`DPTImageProcessor` is commented out in the original repo's `midas.py`** — this is not something we added. The skip-processor pattern was already present in the code as shipped by the original authors.
+2. **`src/encoders/seg_encoder.py` does not exist in the original repo (HTTP 404)** — segmentation conditioning is entirely our custom addition. The original repo has no SegFormer encoder, no Cityscapes pipeline, nothing seg-related.
+3. **The paper (CTRLorALTer, arXiv 2405.07913) only implements depth and style conditioning** — segmentation is not mentioned in the abstract, contributions, experiments, or demos. The project page confirms only depth-based structure conditioning and style conditioning are demonstrated.
+
+#### Code evidence from the original repo (`src/annotators/midas.py`)
+
+```python
+# Lines 6-8: DPTImageProcessor IS imported at the top...
+from transformers import (
+    DPTImageProcessor,         # imported
+    DPTForDepthEstimation,
+)
+
+# Line 28 in __init__: processor instantiation is COMMENTED OUT
+#   self.feature_extractor = DPTImageProcessor.from_pretrained(...)
+
+# Lines 44-48 in forward: processor call is COMMENTED OUT
+#   depth_dict = self.feature_extractor(imgs, do_rescale=False, return_tensors="pt")
+#   for k, v in depth_dict.items():
+#       if isinstance(v, torch.Tensor):
+#           depth_dict[k] = v.to(device=imgs.device)
+
+# Instead — manual preprocessing, direct model call:
+imgs = (imgs + 1.0) / 2.0
+imgs = better_resize(imgs, self.model_size)   # 384
+depth_map = self.depth_estimator(pixel_values=imgs).predicted_depth
+```
+
+This is the **original CompVis code as published**. The authors chose to skip `DPTImageProcessor` and do manual preprocessing. Our `SegmentationEncoder` mirrors this exact decision for the same reason.
+
+#### Side by side — both encoders skip their processor
+
+| | `DepthEstimator` (original repo, midas.py) | `SegmentationEncoder` (our addition, seg_encoder.py) |
+|---|---|---|
+| Source | Original CompVis/LoRAdapter | Custom — does not exist in original repo |
+| Range convert | `(imgs + 1.0) / 2.0` | `(imgs + 1.0) / 2.0` (identical) |
+| Resize | `better_resize(imgs, 384)` | `F.interpolate(imgs, 512)` |
+| Normalize | none (DPT handles it internally) | ImageNet mean/std (SegFormer requires it) |
+| Feature extractor | `DPTImageProcessor` — imported, **commented out** | `SegformerImageProcessor` — not imported at all |
+| Model call | `.predicted_depth` | `.logits` |
+| Exists in paper | Yes — depth conditioning is the paper's core | No — segmentation is our custom extension |
+
+#### Why we followed this pattern
+
+When we built `SegmentationEncoder`, the MiDaS encoder in the repo was already doing manual preprocessing with the processor commented out. Matching that pattern ensures:
+- Both encoders accept the same `[-1, 1]` input contract
+- Both are audited the same way when the preprocessing changes
+- No special cases: "encoder 1 uses the HF processor, encoder 2 doesn't"
 
 ---
 
@@ -125,7 +253,98 @@ seg_colorize_ids(ids, palette)  # [B,H,W] long --> [B,3,H,W] float [0,1]
 
 Both the offline calc script (via `SegJsonDataset`) and the live encoder (`SegmentationEncoder.forward()`) call `seg_colorize_ids()` with this same palette. The palette is NOT stored in a JSON or YAML file — code is the SSOT.
 
-### 5.3 NEAREST Interpolation for Class IDs
+### 5.3 Image Discovery and Path Control — how the pipeline finds your images
+
+Identical concept to DEPTH.md §5.2 — read that first. The differences for segmentation are the key names. This section documents the seg-specific values and the configurable one-step pattern.
+
+#### The three JSONL file types and their key names
+
+```
+data/train.jsonl                          ← source split
+  {"source": "data/raw/000417/raw_image.jpg", "prompt": "..."}
+   ▲ key = "source"
+
+data/seg_training/train.jsonl             ← seg training manifest
+  {"raw_image_path": "data/raw/000417/raw_image.jpg", "seg_path": "data/raw_seg/000417/raw_image.png", "prompt": "..."}
+   ▲ key = "raw_image_path"               ▲ this is the saved class-ID PNG, not the RGB image
+```
+
+Image filename is always `raw_image.jpg`. The seg-map filename is always `raw_image.png` (same stem, different extension — PNG to avoid JPEG compression on class-ID values).
+
+#### One-step configurable discovery (same pattern as depth)
+
+`seg_map_calculations.py` uses `_get_source_key()` — same two-step check as depth. Replace with:
+
+```python
+# ── IMAGE DISCOVERY CONSTANTS (seg_map_calculations.py) ────────────────────── #
+SOURCE_KEY = "source"         # key holding the image path in the source split JSONL
+                               # Change to "raw_image_path" when reading training manifests.
+IMAGE_NAME = "raw_image.jpg"  # expected filename. Set to None to skip the check.
+# ─────────────────────────────────────────────────────────────────────────────── #
+
+
+def resolve_image_path(entry: dict, cwd: Path) -> Path:
+    """
+    Single-step: get the absolute image path from one JSONL entry.
+
+    This is the ONLY function that reads the image path.
+    Seg-pipeline prefix: "resolve_seg_image_path" if you want strict naming.
+
+    Steps in ONE pass:
+      1. Check SOURCE_KEY exists → fail loud with fix instructions.
+      2. Build absolute path (relative paths resolved from cwd = repo root).
+      3. Check filename matches IMAGE_NAME → fail loud if mismatch (unless None).
+
+    To adapt:
+      • Different key name  → change SOURCE_KEY at the top of this file.
+      • Different filename  → change IMAGE_NAME at the top of this file.
+      • No filename check   → set IMAGE_NAME = None.
+    """
+    if SOURCE_KEY not in entry:
+        raise KeyError(
+            f"JSONL entry has no '{SOURCE_KEY}' key.\n"
+            f"  Found keys : {list(entry.keys())}\n"
+            f"  Fix        : update SOURCE_KEY at the top of seg_map_calculations.py."
+        )
+    path = Path(entry[SOURCE_KEY])
+    abs_path = path if path.is_absolute() else cwd / path
+    if IMAGE_NAME is not None and abs_path.name != IMAGE_NAME:
+        raise ValueError(
+            f"Image filename '{abs_path.name}' != expected '{IMAGE_NAME}'.\n"
+            f"  Full path : {abs_path}\n"
+            f"  Fix       : update IMAGE_NAME at the top of seg_map_calculations.py."
+        )
+    return abs_path
+```
+
+#### The full seg discovery flow
+
+```
+data/                          ← --data_dir
+  train.jsonl   ─┐
+  val.jsonl      ├── discovered by _find_split_jsonl(data_dir, "train"/"val"/"test")
+  test.jsonl    ─┘
+      │ each line: {"source": "data/raw/000417/raw_image.jpg", "prompt": "..."}
+      ▼
+  resolve_image_path(entry, cwd)
+      │
+      ├─ 1. entry["source"]    → "data/raw/000417/raw_image.jpg"
+      ├─ 2. cwd / path         → D:\...\LoRAdapter\data\raw\000417\raw_image.jpg
+      └─ 3. .name == "raw_image.jpg"  ✓
+      │
+      ▼
+  SegmentationEncoder.label_ids(tensor)   → class-ID map [512, 512]
+      │
+      ▼
+  saved to data/raw_seg/000417/raw_image.png   (same folder structure as raw/)
+      │
+  seg_training/train.jsonl entry:
+  {"raw_image_path": "data/raw/000417/raw_image.jpg",
+   "seg_path":       "data/raw_seg/000417/raw_image.png",
+   "prompt":         "..."}
+```
+
+### 5.4 NEAREST Interpolation for Class IDs
 
 When `SegJsonDataset` loads a saved seg PNG and resizes it, it uses `NEAREST` interpolation, not bilinear. This is critical:
 
@@ -134,7 +353,7 @@ When `SegJsonDataset` loads a saved seg PNG and resizes it, it uses `NEAREST` in
 
 The resize happens in `_load_seg_colormap()` before `seg_colorize_ids()` is called.
 
-### 5.4 `build_seg_square_preprocess()` — Single Source of Truth
+### 5.5 `build_seg_square_preprocess()` — Single Source of Truth
 
 The depth pipeline triplicates its preprocessing across three files. The seg pipeline fixes this with a single factory function:
 
@@ -145,12 +364,12 @@ def build_seg_square_preprocess(size, resize_mode="letterbox"):
 ```
 
 This function is imported by both:
-- `calculate_segmentation_map.py` (Stage C offline)
-- `inference_seg.py` (Stage D live inference)
+- `seg_map_calculations.py` (Stage C offline)
+- `seg_inference.py` (Stage D live inference)
 
 Parity is guaranteed by construction — there is only one definition.
 
-### 5.5 skip_encode — Same Pattern as Depth
+### 5.6 skip_encode — Same Pattern as Depth
 
 ```python
 model.forward_easy(..., skip_encode=True)   # training:  uses pre-saved colour PNG
@@ -159,21 +378,17 @@ model.sample(...)                            # inference: calls SegFormer live
 
 During training `batch["seg"]` contains the colour map loaded from the saved PNG via `SegJsonDataset`. `skip_encode=True` bypasses the SegFormer entirely. During inference, `SegmentationEncoder.forward()` runs live inside `model.sample()`.
 
-### 5.6 Checkpoint Grid, val_steps/ckpt_steps, test.json
+### 5.7 Checkpoint Grid, val_steps/ckpt_steps, test.json
 
-Identical to the depth pipeline — see DEPTH.md §5.4–5.6. The seg trainer (`train_seg.py`) is a direct mirror of `train_depth.py` with `batch["depth"]` replaced by `batch["seg"]` and depth-specific helpers renamed to their `_seg_*` equivalents.
+Identical to the depth pipeline — see DEPTH.md §5.4–5.6. The seg trainer (`seg_training.py`) is a direct mirror of `train_depth.py` with `batch["depth"]` replaced by `batch["seg"]` and depth-specific helpers renamed to their `_seg_*` equivalents.
 
-### 5.7 SegFormer-b5 vs b0 — Why b0 is Wrong
+### 5.8 SegFormer-b5 vs b0 — Why b0 is Wrong
 
 SegFormer-b0 is a small model designed for speed, not accuracy. On Cityscapes driving scenes:
 - b0 misclassifies thin structures (pedestrian poles, traffic lights) that matter for structural conditioning.
 - b5 achieves significantly higher mIoU on Cityscapes, especially on boundary-sensitive classes.
 
-Two old experiment configs (`train_seg_12gb.yaml`, `train_seg_cluster.yaml`) incorrectly reference b0:
-```yaml
-model: "nvidia/segformer-b0-finetuned-cityscapes-1024-1024"  # WRONG
-```
-These files also have wrong JSON paths (missing `data/` prefix). **Do not use them.** Use `configs/experiment/train_seg.yaml` only.
+Two old experiment configs (`train_seg_12gb.yaml`, `train_seg_cluster.yaml`) incorrectly referenced b0 and had wrong JSON paths (missing `data/` prefix). **Deleted on 2026-06-30** — confirmed no other file referenced them (grepped the repo), confirmed `train_seg.yaml` fully supersedes them. Use `configs/experiment/train_seg.yaml` only.
 
 ---
 
@@ -199,8 +414,8 @@ tag: seg
 local_files_only: true
 ignore_check: true
 data:
-  json_file:     data/seg_training/train.json
-  val_json_file: data/seg_training/val.json   # NEVER test.json here
+  json_file:     data/seg_training/train.jsonl
+  val_json_file: data/seg_training/val.jsonl   # NEVER test.json here
 lora:
   struct:
     encoder:
@@ -218,14 +433,11 @@ local_files_only: ${local_files_only}
 
 ### Dead keys (same as depth pipeline)
 
-`use_empty_prompt_eval`, `n_samples`, `save_grid`, `log_cond` — present in base config, not read by `train_seg.py`.
+`use_empty_prompt_eval`, `n_samples`, `save_grid`, `log_cond` — present in base config, not read by `seg_training.py`.
 
-### Broken configs (do not use)
+### Broken configs (deleted)
 
-| File | Bug |
-|------|-----|
-| `configs/experiment/train_seg_12gb.yaml` | b0 model; wrong JSON paths (missing `data/` prefix); `local_files_only: false` |
-| `configs/experiment/train_seg_cluster.yaml` | Same bugs as above |
+`train_seg_12gb.yaml` and `train_seg_cluster.yaml` (b0 model, wrong JSON paths) were deleted on 2026-06-30 — `train_seg.yaml` is now the only seg experiment config and supersedes both use cases (12GB single-GPU and multi-GPU launch instructions are both documented inline in `train_seg.yaml`'s footer).
 
 ---
 
@@ -254,24 +466,24 @@ conda activate loradapter
 
 Dry run on 1 image first:
 ```powershell
-python calculate_segmentation_map.py --data_dir data/ --dry_run_n 1 --local_files_only False
+python seg_map_calculations.py --data_dir data/ --dry_run_n 1 --local_files_only False
 ```
 Success: no errors; seg PNG written to `data/raw_seg/`; class IDs in `[0, 18]`.
 
 Full run (after b5 model is cached):
 ```powershell
-python calculate_segmentation_map.py --data_dir data/
+python seg_map_calculations.py --data_dir data/
 ```
 Success:
 - `data/raw_seg/` populated (one 8-bit PNG per image)
-- `data/seg_training/train.json`, `val.json`, `test.json` written
+- `data/seg_training/train.jsonl`, `val.json`, `test.json` written
 - Verification output shows `0 failures`
 - Dataset sizes: 639 train / 137 val / 137 test
 
 ### Stage D — Training
 
 ```powershell
-python train_seg.py experiment=train_seg
+python seg_training.py experiment=train_seg
 ```
 
 Expected startup log:
@@ -301,7 +513,7 @@ The tfevents hostname field will be `seg` (from `cfg.tag = "seg"`), not the mach
 ### Stage D — Inference
 
 ```powershell
-python inference_seg.py \
+python seg_inference.py \
   ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/best_model \
   inference.input_dir=data/raw
 ```
@@ -337,23 +549,23 @@ Success: 4-panel JPG grids written to `outputs/inference/seg/`.
 
 | Item | Description | Status | Evidence |
 |------|-------------|--------|----------|
-| S1 | Config files — correct experiment YAML | PARTIAL | `configs/experiment/train_seg.yaml` correct (b5, right paths). Two stale configs (`train_seg_12gb.yaml`, `train_seg_cluster.yaml`) still exist with wrong b0 model + wrong JSON paths. Not deleted yet. Do not use them. |
+| S1 | Config files — correct experiment YAML | **FIXED** | `configs/experiment/train_seg.yaml` confirmed correct (b5 model, correct `data/seg_training/*.json` paths). The two stale b0 configs (`train_seg_12gb.yaml`, `train_seg_cluster.yaml`) were deleted on 2026-06-30 after grepping the repo to confirm nothing else referenced them. |
 | S2 | b5 model availability | FIXED | Model was in HF cache (`~/.cache/huggingface/hub/models--nvidia--segformer-b5-finetuned-cityscapes-1024-1024/`). Copied to `checkpoints/local_models/segformer-b5-cityscapes/` on 2026-06-30. Dry run with `local_files_only=True` confirmed load succeeded (19 classes, 1172 weights loaded). |
-| S3 | Stage C — offline seg map generation | **PASS** | `python calculate_segmentation_map.py --data_dir data/` completed with 0 errors. 913 PNG files written to `data/raw_seg/`. All 3 JSON splits verified by built-in checker: `train.json 639/639`, `val.json 137/137`, `test.json 137/137`. PNG inspection: shape `(512, 512)`, dtype `uint8`, values in `[0, 18]` — correct. |
-| S4 | Stage D — training startup | PENDING FIRST RUN | `train_seg.py` mirrors `train_depth.py` exactly; training not yet executed. Next step: `python train_seg.py experiment=train_seg`. Success criterion: startup log shows `19 classes`, loss begins decreasing within first 100 steps. |
-| S5 | Train/inference preprocessing parity | CODE READS CORRECT — NOT YET VERIFIED BY EXECUTION | `build_seg_square_preprocess()` SSOT confirmed imported by both `calculate_segmentation_map.py` and `inference_seg.py`. Parity is guaranteed by construction. Cannot be verified by execution until inference is run with a trained checkpoint. |
+| S3 | Stage C — offline seg map generation | **PASS** | `python seg_map_calculations.py --data_dir data/` completed with 0 errors. 913 PNG files written to `data/raw_seg/`. All 3 JSON splits verified by built-in checker: `train.json 639/639`, `val.json 137/137`, `test.json 137/137`. PNG inspection: shape `(512, 512)`, dtype `uint8`, values in `[0, 18]` — correct. |
+| S4 | Stage D — training startup | PENDING FIRST RUN | `seg_training.py` mirrors `train_depth.py` exactly; training not yet executed. Next step: `python seg_training.py experiment=train_seg`. Success criterion: startup log shows `19 classes`, loss begins decreasing within first 100 steps. |
+| S5 | Train/inference preprocessing parity | CODE READS CORRECT — NOT YET VERIFIED BY EXECUTION | `build_seg_square_preprocess()` SSOT confirmed imported by both `seg_map_calculations.py` and `seg_inference.py`. Parity is guaranteed by construction. Cannot be verified by execution until inference is run with a trained checkpoint. |
 | S6 | Val loss + checkpoint grid | PENDING FIRST RUN | Blocked on S4 (training). Code mirrors train_depth.py's verified grid logic. |
 | S7 | TensorBoard tags | PENDING FIRST RUN | Blocked on S4. Expected tags: `train/loss`, `train/lr`, `val/loss`, `val/sample_00`…`val/sample_09`. |
-| S8 | Inference | PENDING FIRST RUN | `inference_seg.py` untested — no checkpoint available yet. Blocked on S4. |
-| S9 | Known issues documented | DOCUMENTED | See §8 above. Two stale configs (S1), NEAREST-resize slow on large batches, no test-eval script. |
+| S8 | Inference | PENDING FIRST RUN | `seg_inference.py` untested — no checkpoint available yet. Blocked on S4. |
+| S9 | Known issues documented | DOCUMENTED | See §8 above. NEAREST-resize slow on large batches, no test-eval script. Stale configs (formerly S1) are now deleted, not just documented. |
 
 ### What is now unblocked
 
-Stage C is verified. The single remaining blocker before training can start is **running `train_seg.py`** — there are no more missing models, no empty data directories, no broken JSON paths. All prerequisites are met.
+Stage C is verified. The single remaining blocker before training can start is **running `seg_training.py`** — there are no more missing models, no empty data directories, no broken JSON paths. All prerequisites are met.
 
 ```powershell
 # Run on Ubuntu (final training machine):
-python train_seg.py experiment=train_seg
+python seg_training.py experiment=train_seg
 ```
 
 Watch for these in the first 50 steps to confirm training is working:
@@ -361,3 +573,175 @@ Watch for these in the first 50 steps to confirm training is working:
 - `Number params Mapper Network(s) 1,245,072` (same as depth — encoder frozen)
 - `val/loss` decreasing (not stuck at a constant)
 - Checkpoint grid at step 1000 shows recognisable colour blobs per Cityscapes class
+
+---
+
+## 10 · Full Parameter Control
+
+Everything you can tune, where it lives, and what changing it does. Mirrors DEPTH.md §9 with seg-specific values. Read §9 first for concepts, then use this section for seg-specific differences.
+
+---
+
+### 10.1 How Hydra overrides work
+
+See DEPTH.md §9.1 — identical for seg. The key difference: the experiment config file is `configs/experiment/train_seg.yaml`. Resolved config is written to `outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/.hydra/config.yaml` after each run.
+
+```powershell
+# Override any key without editing a file:
+python seg_training.py experiment=train_seg epochs=3 val_steps=100 data.batch_size=2
+```
+
+---
+
+### 10.2 Stage C — `seg_map_calculations.py` CLI flags
+
+Run once before training to precompute segmentation-ID PNGs from raw images.
+
+```powershell
+python seg_map_calculations.py --data_dir data/ [flags]
+```
+
+| Flag | Default | What it does | When to change |
+|------|---------|--------------|----------------|
+| `--data_dir` | *(required)* | Folder containing `train.jsonl`, `val.jsonl`, `test.jsonl`. Non-default names like `my_train.jsonl` are found automatically if the stem contains "train"/"val"/"test". | Always set. |
+| `--dry_run_n N` | off | Process only the first N images per split. Always run `--dry_run_n 2` first to check model loading and output format. | Use before every full run on a new machine. |
+| `--size` | `512` | Square side for saved seg-ID PNGs. Must match `size` in training config. Changing this requires rerunning Stage C. | Keep 512 unless you change training resolution. |
+| `--batch_size` | `4` | Images fed to SegFormer at once. | Lower if you get OOM. SegFormer-b5 is heavier than DPT so you may need `--batch_size 2`. |
+| `--model` | `checkpoints/local_models/segformer-b5-cityscapes` | Local path to SegFormer-b5. **Locked — do not change to b0 or any other variant.** See §4.1 for why b5 is non-negotiable. | Only if you moved the model files. |
+| `--local_files_only` | `True` | Offline-only loading from the local model path. | Keep `True` now that b5 is in `checkpoints/local_models/`. |
+| `--device` | `cuda` if available | `cuda` or `cpu`. | `cpu` is very slow for SegFormer-b5 (~10x slower). |
+| `--resize_mode` | `letterbox` | How to make the image square before SegFormer. `letterbox` = edge-replication padding (locked default). `stretch` = squash to square (silently distorts geometry). **Never change this.** See DEPTH.md §5.1 for the full argument. | Do not change. |
+| `--no_skip` | off | Recompute seg PNGs even if they already exist. | Add if you changed `--model` or `--size` and need to regenerate. |
+| `--raw_dir` | `<data_dir>/raw` | Root of raw image tree. | Only if images are not under `<data_dir>/raw/`. |
+| `--seg_dir` | `<data_dir>/raw_seg` | Where seg-ID PNGs are saved. | Only to redirect output. |
+| `--output_dir` | `<data_dir>/seg_training` | Where the output `train.jsonl`, `val.jsonl`, `test.jsonl` manifests are written. | Only to redirect manifest location. |
+
+---
+
+### 10.3 Stage D Training — `configs/experiment/train_seg.yaml`
+
+Identical structure to depth (DEPTH.md §9.3). Differences are noted below; everything else is the same.
+
+#### Resolution and hardware — identical to depth
+
+Same keys (`size`, `bf16`, `gradient_checkpointing`, `gradient_accumulation_steps`, `data.batch_size`, `data.workers`) with the same defaults. See DEPTH.md §9.3.
+
+#### Learning rate and schedule — identical to depth
+
+Same keys and defaults. The learning rate is kept identical to depth so val/loss curves are directly comparable between the two pipelines.
+
+#### When to save / validate — identical to depth
+
+Same keys (`val_steps=500`, `ckpt_steps=1000`, `val_batches=64`). See DEPTH.md §9.3.
+
+#### Checkpoint monitoring grid — one difference from depth
+
+| Key | Default (seg) | Difference from depth |
+|-----|--------------|----------------------|
+| `n_grid_images` | `10` | Identical: 5 fixed + 5 fresh per checkpoint. Fixed scenes chosen once at startup with OS entropy; same scenes appear in every checkpoint grid. Files: `sample_00_fixed.jpg`…`sample_04_fixed.jpg`, `sample_05_new.jpg`…`sample_09_new.jpg`. |
+| `grid_include_empty_prompt` | `false` | Depth default is also `false`. For seg the empty-prompt panel is called "RAW SEG GEN" (generation with empty text, pure seg conditioning). |
+
+**Reading the seg checkpoint grid:** Each panel row is `ORIGINAL | SEG MAP | PREDICTED`. The SEG MAP column shows the 19-class Cityscapes colour palette — you should see distinct road (purple), sky (steel blue), vegetation (green), and car (deep blue) regions. If the SEG MAP looks like a uniform colour smear, the seg encoder is producing bad predictions; check the SegFormer model files.
+
+#### Dataset and model paths — seg-specific
+
+| Key | Default | What it does | When to change |
+|-----|---------|--------------|----------------|
+| `data.json_file` | `data/seg_training/train.jsonl` | Training manifest. Each line: `{raw_image_path, seg_path, prompt}`. | Change if your dataset is elsewhere. |
+| `data.val_json_file` | `data/seg_training/val.jsonl` | Val manifest. **Never `test.jsonl` here.** | Only change to use a different val set. |
+| `data.image_root` | `null` (= repo root) | Prepended to relative `raw_image_path` values. Set to `/mnt/dataset` when images are on a different drive. | **Required when training on Ubuntu with images at a different path.** Same rule as depth. |
+| `seg_model_path` | `checkpoints/local_models/segformer-b5-cityscapes` | Local SegFormer-b5. Used at **inference only** (skip_encode=True means it's not loaded during training). | Only if you moved the model. |
+| `lora.struct.ckpt_path` | `null` | Resume from checkpoint. | Same usage as depth. |
+
+---
+
+### 10.4 Stage D Inference — `configs/inference_seg.yaml`
+
+```powershell
+# From a JSONL manifest:
+python seg_inference.py \
+  ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/best_model \
+  inference.json_file=data/seg_training/test.jsonl
+
+# Single image:
+python seg_inference.py \
+  ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/best_model \
+  "inference.images=[data/raw/000417/raw_image.jpg]" \
+  "inference.prompts=['a driving scene at night in the rain']"
+```
+
+| Key | Default | What it does | When to change |
+|-----|---------|--------------|----------------|
+| `ckpt_path` | *(required)* | Path to a checkpoint folder. Usually `best_model/` or a specific `checkpoint-epoch1/step1000/`. | Always set. |
+| `inference.json_file` | `null` | JSONL to run inference on. | Use `test.jsonl` for final evaluation. Never `val.jsonl` or `train.jsonl`. |
+| `inference.images` | `[]` | Direct list of image paths. | Quick single-image tests. |
+| `inference.prompts` | `[]` | Prompts matching `inference.images`. | Required when using `inference.images`. |
+| `inference.output_dir` | `outputs/inference/seg/results` | Where generated images are saved. Resolved from repo root. | Change per experiment. |
+| `inference.save_generated_only` | `false` | `true` = save only the predicted image (no 4-panel grid). | Set `true` for clean batch evaluation. |
+| `inference.resize_mode` | `letterbox` | Squaring method before SegFormer. **Must match `--resize_mode` used in Stage C (default: letterbox).** Changing this breaks train/inference parity. | Do not change. |
+| `inference.n_samples` | `1` | Images generated per input. | `2`–`4` for diversity. |
+| `inference.num_inference_steps` | `50` | Diffusion denoising steps. | `20` preview, `50` quality, `80`+ max. |
+| `inference.guidance_scale` | `7.5` | CFG scale. Higher = more prompt-driven. | `3`–`5` creative, `7.5` standard, `12`+ tight. |
+| `local_files_only` | `true` | Offline mode. | Keep `true`. |
+
+---
+
+### 10.5 Common scenarios — exact commands
+
+#### Smoke test (verify pipeline works, ~5 minutes)
+```powershell
+python seg_map_calculations.py --data_dir data/ --dry_run_n 3
+
+python seg_training.py experiment=train_seg `
+  epochs=1 val_steps=10 ckpt_steps=20 val_batches=4 n_grid_images=2 `
+  "data.workers=0" ignore_check=true
+```
+
+#### Full training run (Ubuntu, 5 epochs)
+```bash
+python seg_training.py experiment=train_seg
+```
+
+#### Resume interrupted training
+```bash
+python seg_training.py experiment=train_seg \
+  "lora.struct.ckpt_path=outputs/train/seg/runs/2026-07-01/00-47-30/checkpoint-epoch2/step4000"
+```
+
+#### Reduce memory (OOM on a 12 GB GPU)
+```powershell
+python seg_training.py experiment=train_seg data.batch_size=1 gradient_accumulation_steps=4
+```
+
+#### Images on a different drive (Ubuntu training with images at /mnt/data)
+```bash
+python seg_training.py experiment=train_seg data.image_root=/mnt/data
+```
+
+#### Watch 20 fixed scenes per checkpoint (strong convergence signal)
+```powershell
+python seg_training.py experiment=train_seg n_grid_images=40
+# 20 fixed + 20 fresh — each checkpoint grid shows same 20 scenes for comparison
+```
+
+#### Add empty-prompt panel (see pure seg conditioning)
+```powershell
+python seg_training.py experiment=train_seg grid_include_empty_prompt=true
+# 4th panel: "RAW SEG GEN" — no text, only the seg map drives generation
+```
+
+#### Evaluate on test split after training
+```powershell
+python seg_inference.py `
+  ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/best_model `
+  inference.json_file=data/seg_training/test.jsonl `
+  inference.save_generated_only=true `
+  inference.output_dir=outputs/inference/seg/test_eval
+```
+
+#### Generate comparison report (depth vs seg)
+```powershell
+python training_report.py
+python training_report.py --markdown   # GitHub-flavoured Markdown
+```
+

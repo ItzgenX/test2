@@ -25,7 +25,7 @@ seed: 42
 val_batches: 4
 save_grid: true
 
-# Segmentation-specific monitoring knobs (resolved by train_seg.py via cfg.get()).
+# Segmentation-specific monitoring knobs (resolved by seg_training.py via cfg.get()).
 # Set here as base defaults; the experiment yaml overrides with the real values.
 # n_grid_images          : N val scenes per checkpoint (split 50/50 fixed/fresh).
 # grid_include_empty_prompt: also render the 4th "RAW SEG GEN" (empty-prompt) panel.

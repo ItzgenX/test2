@@ -17,9 +17,9 @@ The result: the model generates images that follow the supplied depth map's spat
 
 | Stage | File | When |
 |-------|------|------|
-| A — offline preprocessing | `pre_depth_calculations.py` | **Once**, before any training |
-| B — training | `train_depth.py` | Iterative; resumes from checkpoint |
-| B — inference | `inference_depth.py` | After training; per-image generation |
+| A — offline preprocessing | `depth_map_calculations.py` | **Once**, before any training |
+| B — training | `depth_training.py` | Iterative; resumes from checkpoint |
+| B — inference | `depth_inference.py` | After training; per-image generation |
 
 Supporting files:
 
@@ -41,7 +41,7 @@ Supporting files:
 RAW IMAGE (arbitrary aspect ratio)
         |
         v
-  [Stage A -- pre_depth_calculations.py]  (run ONCE offline)
+  [Stage A -- depth_map_calculations.py]  (run ONCE offline)
         |
         +-- SquarePad (edge-replication) --> square image (no distortion)
         +-- Resize to 512x512
@@ -53,7 +53,7 @@ RAW IMAGE (arbitrary aspect ratio)
 
         |
         v
-  [Stage B -- train_depth.py]  (per training step)
+  [Stage B -- depth_training.py]  (per training step)
         |
         +-- DepthJsonDataset.__getitem__:
         |     read depth PNG (L mode) --> replicate to 3 channels --> Tensor [0,1]
@@ -69,7 +69,7 @@ RAW IMAGE (arbitrary aspect ratio)
 
         |
         v
-  [Stage B -- inference_depth.py]
+  [Stage B -- depth_inference.py]
         |
         +-- Raw image --> SquarePad-->Resize-->ToTensor-->Normalize [-1,1]
         |   (same chain, applied LIVE here -- no pre-saved depth PNG needed)
@@ -94,6 +94,103 @@ Key behaviours:
 - **Output shape**: `[B, 1, H, W]` float32 in `[0, 1]` (after normalisation).
 - **3-channel replication**: `DepthJsonDataset` replicates the single-channel PNG to 3 channels so the mapper network sees the same tensor shape it would see from a colour-image encoder.
 
+### 4.1 The 384 question — why `better_resize(384)` and not 512
+
+You will see `self.model_size = 384` in `src/annotators/midas.py` and wonder: our whole pipeline uses 512×512, so why is there a 384 here?
+
+**Answer: 384 is DPT-Hybrid-MiDaS's native training resolution. The depth model expects 384×384 input. 512 is the LoRAdapter pipeline canvas size. They serve different purposes and the two sizes correctly coexist.**
+
+Here is the full image journey through the depth pipeline:
+
+```
+RAW IMAGE (e.g. 1280×800)
+    │
+    ▼ [Stage A preprocessing — depth_map_calculations.py]
+    SquarePad()             → 1280×1280  (edge-replication, no distortion)
+    Resize(512, 512)        → 512×512    (our pipeline canvas)
+    ToTensor + Normalize    → [-1, 1]
+    │
+    ▼ [Inside DepthEstimator.forward() — midas.py]
+    (imgs + 1.0) / 2.0      → [0, 1]    (convert from pipeline format)
+    better_resize(384)      → 384×384   ← MiDaS's REQUIRED input size
+    │   (center_crop to square → already square, so no-op)
+    │   (avg_pool2d if needed → downscale factor = 512//384 = 1, so no-op)
+    │   (bilinear interpolate to 384 → actual resize 512→384)
+    depth_estimator(pixel_values)  →  depth logits 384×384
+    F.interpolate(self.size=512)   →  depth map 512×512  (back to our canvas)
+    min-max normalize per image    →  depth in [0, 1]
+    cat([depth]*3)                 →  [B, 3, 512, 512]   (3-channel for mapper)
+```
+
+**The two 512s bookend the 384:**
+- The image ENTERS DepthEstimator at 512×512 (our canvas, after SquarePad+Resize)
+- `better_resize(384)` shrinks it to 384×384 for the model to run on
+- `F.interpolate(512)` expands the depth map BACK to 512×512 (our canvas)
+
+**Why 384 specifically?** DPT-Hybrid-MiDaS was fine-tuned on MiX-6 at 384×384 (that is the checkpoint's training size). Running it at exactly 384 gives the sharpest depth predictions. Running it larger or smaller changes the patch embedding stride resolution and degrades results.
+
+**The `center_crop` in `better_resize` — why it is not dangerous here:**
+
+```python
+# src/annotators/util.py — better_resize() full implementation
+def better_resize(imgs, image_size):
+    H, W = imgs.shape[-2:]
+    side  = min(H, W)             # e.g. min(512, 512) = 512
+    imgs  = center_crop(imgs, [side, side])  # 512×512 → 512×512: NO-OP (already square)
+    factor = side // image_size   # 512 // 384 = 1 → NO avg_pool
+    if factor > 1:
+        imgs = avg_pool2d(imgs, factor)
+    imgs = interpolate(imgs, [image_size, image_size], mode="bilinear")
+    return imgs
+```
+
+Because SquarePad already made the image square BEFORE it reaches `better_resize`, the `center_crop` step is a geometric no-op — cropping a 512×512 square to min(512,512)=512 changes nothing. Without SquarePad, a 1280×800 landscape image would be center-cropped to 800×800, silently discarding the left and right 240 px of content.
+
+---
+
+### 4.2 Q&A — Do we use `DPTImageProcessor`? Is this the original code?
+
+**Q: The HuggingFace DPT example uses `DPTImageProcessor` + `DPTForDepthEstimation`. Do we use both?**
+
+**A: `DPTForDepthEstimation` yes. `DPTImageProcessor` no — it is imported but commented out. This is the ORIGINAL CompVis code, not something we changed.**
+
+**Verified by:**
+- `git diff HEAD -- src/annotators/midas.py` returns empty — zero changes since the initial commit
+- Fetching `https://raw.githubusercontent.com/CompVis/LoRAdapter/main/src/annotators/midas.py` directly and comparing line by line — files are byte-for-byte identical
+
+The original authors shipped `midas.py` with the processor commented out and manual preprocessing in its place. We inherited this code unchanged.
+
+#### What the original code does (lines 6–50 of `src/annotators/midas.py`)
+
+```python
+from transformers import (
+    DPTImageProcessor,        # imported but NEVER used
+    DPTForDepthEstimation,    # this IS used
+)
+
+class DepthEstimator(nn.Module):
+    def __init__(self, size, model, local_files_only):
+        self.depth_estimator = DPTForDepthEstimation.from_pretrained(model, ...)
+        # self.feature_extractor = DPTImageProcessor.from_pretrained(...)  # COMMENTED OUT
+
+    def forward(self, imgs):
+        imgs = (imgs + 1.0) / 2.0          # [-1,1] -> [0,1]  (manual, no processor)
+        imgs = better_resize(imgs, 384)     # resize to 384     (manual, no processor)
+        # depth_dict = self.feature_extractor(...)              # COMMENTED OUT
+        depth_map = self.depth_estimator(pixel_values=imgs).predicted_depth
+        # ... min-max normalise, replicate to 3 channels
+```
+
+#### Why the original authors skipped the processor
+
+`DPTImageProcessor` resizes the image and normalises pixel values. But `DepthEstimator` already does both steps manually in two lines before calling the model:
+1. `(imgs + 1.0) / 2.0` — convert from the pipeline's `[-1, 1]` to `[0, 1]`
+2. `better_resize(imgs, 384)` — resize to the model's input size
+
+Using the processor on top of this would double-process the image and break the input contract. The manual path is also faster (no CPU round-trip, no dict wrapping) and keeps the preprocessing visible in the code rather than hidden inside a HuggingFace object.
+
+Our `SegmentationEncoder` in `src/encoders/seg_encoder.py` was deliberately designed to mirror this exact pattern — see SEGMENTATION.md §4.2 and §4.3 for the full comparison.
+
 ---
 
 ## 5 · Key Design Concepts
@@ -104,13 +201,138 @@ Key behaviours:
 
 **Why it's required**: MiDaS's `better_resize()` internally crops to a square before running. Without `SquarePad`, a landscape image would lose its left and right portions inside the DPT encoder. The padding is applied **in all three preprocessing sites** to ensure consistency:
 
-1. `pre_depth_calculations.py` — Stage A offline preprocess
-2. `inference_depth.py` — Stage B live inference preprocess
+1. `depth_map_calculations.py` — Stage A offline preprocess
+2. `depth_inference.py` — Stage B live inference preprocess
 3. `configs/data/local_depth.yaml` — Stage B training transform chain (for raw images)
 
 **Triplication risk**: These three sites must stay byte-identical. If you change the preprocessing (e.g., add a normalisation step), update all three.
 
-### 5.2 skip_encode — Training vs Inference Path
+### 5.2 Image Discovery and Path Control — how the pipeline finds your images
+
+This section answers: where does the pipeline look for images, what key in the JSONL tells it where the image is, and what do you change if your dataset has a different folder structure or filename convention?
+
+#### The three JSONL file types and their key names
+
+There are three distinct JSONL formats in this pipeline. Each uses a different key to store the image path:
+
+```
+data/train.jsonl                          ← source split (created by dataset prep)
+  {"source": "data/raw/000417/raw_image.jpg", "prompt": "..."}
+   ▲ key = "source"
+
+data/depth_training/train.jsonl           ← depth training manifest (created by depth_map_calculations.py)
+  {"raw_image_path": "data/raw/000417/raw_image.jpg", "depth_path": "...", "prompt": "..."}
+   ▲ key = "raw_image_path"
+
+data/seg_training/train.jsonl             ← seg training manifest (created by seg_map_calculations.py)
+  {"raw_image_path": "data/raw/000417/raw_image.jpg", "seg_path": "...", "prompt": "..."}
+   ▲ key = "raw_image_path"
+```
+
+Image filename is always `raw_image.jpg` — the folder name (`000417/`) is the scene identifier.
+
+#### The current two-step check and its problem
+
+`depth_map_calculations.py` uses `_get_source_key()` which does a sequential key-name lookup:
+
+```python
+# depth_map_calculations.py — current implementation
+def _get_source_key(entry: dict) -> str:
+    if "source" in entry:          # check 1: source split format
+        return entry["source"]
+    if "raw_image_path" in entry:  # check 2: training manifest format
+        return entry["raw_image_path"]
+    raise KeyError(f"Entry has neither 'source' nor 'raw_image_path' key. ...")
+```
+
+**Problem:** if you change the key name in your JSONL, you must find and update this function. If you add a third format, you add a third elif. The key name is buried in logic rather than declared as a constant. There is no single place to change "what is the image key called" across the whole script.
+
+#### One-step configurable replacement
+
+Replace the two-step check with one constant at the top of the script and one resolver function. If the key name or filename ever changes, you change ONE line:
+
+```python
+# ── IMAGE DISCOVERY CONSTANTS ─────────────────────────────────────────────── #
+# These are the ONLY two places that know about key names and filenames.
+# Change them here and every function in this file picks up the change.
+
+SOURCE_KEY = "source"         # key that holds the image path in the SOURCE split JSONL
+                               # (data/train.jsonl, data/val.jsonl, data/test.jsonl)
+                               # Change to "raw_image_path" if you use training manifests as input.
+                               # Change to "image" or any other name if your dataset uses it.
+
+IMAGE_NAME = "raw_image.jpg"  # expected filename at the end of every image path.
+                               # Set to None to disable the filename check entirely.
+# ────────────────────────────────────────────────────────────────────────────── #
+
+
+def resolve_image_path(entry: dict, cwd: Path) -> Path:
+    """
+    Single-step: get the absolute image path from one JSONL entry.
+
+    This is the ONLY function that reads the image path from an entry.
+    All other functions call this; none of them know the key name directly.
+
+    Steps in ONE pass:
+      1. Check SOURCE_KEY exists → fail loud with instructions if not.
+      2. Build absolute path (relative paths resolved from cwd = repo root).
+      3. Check filename matches IMAGE_NAME → fail loud if not (unless IMAGE_NAME is None).
+
+    To adapt to a new dataset:
+      • Different key name  → change SOURCE_KEY above.
+      • Different filename  → change IMAGE_NAME above.
+      • No filename check   → set IMAGE_NAME = None above.
+    """
+    if SOURCE_KEY not in entry:
+        raise KeyError(
+            f"JSONL entry has no '{SOURCE_KEY}' key.\n"
+            f"  Found keys : {list(entry.keys())}\n"
+            f"  Fix        : update SOURCE_KEY at the top of this file to match your JSONL."
+        )
+
+    raw = entry[SOURCE_KEY]
+    path = Path(raw)
+    abs_path = path if path.is_absolute() else cwd / path
+
+    if IMAGE_NAME is not None and abs_path.name != IMAGE_NAME:
+        raise ValueError(
+            f"Image filename '{abs_path.name}' does not match expected '{IMAGE_NAME}'.\n"
+            f"  Full path  : {abs_path}\n"
+            f"  Fix        : update IMAGE_NAME at the top of this file, "
+            f"or set IMAGE_NAME = None to skip this check."
+        )
+
+    return abs_path
+```
+
+#### Why one step is better than two
+
+| | Two-step (`_get_source_key`) | One-step (`resolve_image_path`) |
+|---|---|---|
+| Key name knowledge | Buried inside `if` chain | Declared once as `SOURCE_KEY = "..."` |
+| Filename check | Not done | Done in same pass, same function |
+| Adding a new format | Add another `elif` | Change one constant |
+| Finding "where is the image key" | Search the function | Read the constant at the top of the file |
+| Error message quality | "Entry has neither X nor Y key" | "Update SOURCE_KEY at the top of this file" |
+
+#### The full discovery flow
+
+```
+data/                          ← --data_dir
+  train.jsonl    ─┐
+  val.jsonl       ├── discovered by _find_split_jsonl(data_dir, "train"/"val"/"test")
+  test.jsonl     ─┘   (looks for exact name, then any *.jsonl with split name in stem)
+      │
+      │ each line is one JSONL entry
+      ▼
+  resolve_image_path(entry, cwd)
+      │
+      ├─ 1. entry[SOURCE_KEY]          → "data/raw/000417/raw_image.jpg"
+      ├─ 2. cwd / path                 → D:\...\LoRAdapter\data\raw\000417\raw_image.jpg
+      └─ 3. abs_path.name == "raw_image.jpg"  ✓ (or IMAGE_NAME=None to skip)
+```
+
+### 5.3 skip_encode — Training vs Inference Path
 
 ```python
 model.forward_easy(..., skip_encode=True)   # training:   uses pre-saved depth PNG
@@ -150,14 +372,14 @@ These are **independent**. You can validate every 50 steps and checkpoint every 
 
 `best_model/` is written by `do_validation` (when val/loss improves), not by `save_ckpt_and_grid`. `best_model/info.txt` records the step and val/loss it came from.
 
-### 5.6 Why test.json Is Never Touched During Training
+### 5.6 Why test.jsonl Is Never Touched During Training
 
-`data/depth_training/test.json` is written by `pre_depth_calculations.py` alongside `train.json` and `val.json`, but **no training or validation config ever reads it**. It exists so you can run a final held-out evaluation after training is complete, using `inference_depth.py`.
+`data/depth_training/test.jsonll` is written by `depth_map_calculations.py` alongside `train.jsonl` and `val.jsonl`, but **no training or validation config ever reads it**. It exists so you can run a final held-out evaluation after training is complete, using `depth_inference.py`.
 
 Training configs (`configs/experiment/train_depth.yaml`) reference only:
 ```yaml
-json_file:     data/depth_training/train.json
-val_json_file: data/depth_training/val.json
+json_file:     data/depth_training/train.jsonll
+val_json_file: data/depth_training/val.jsonll
 ```
 
 The test split stays clean.
@@ -199,7 +421,7 @@ Verified result: `events.out.tfevents.1782770112.depth.13012.0` — the field is
 | `ignore_check` | `false` | Suppress data-integrity pre-check |
 | `prompt` | `null` | If set, overrides all per-sample captions |
 
-**Dead keys** (present in config but NOT read by `train_depth.py`):
+**Dead keys** (present in config but NOT read by `depth_training.py`):
 
 | Key | Why it exists |
 |-----|---------------|
@@ -228,8 +450,8 @@ tag: depth
 local_files_only: true
 ignore_check: true
 data:
-  json_file:     data/depth_training/train.json
-  val_json_file: data/depth_training/val.json
+  json_file:     data/depth_training/train.jsonll
+  val_json_file: data/depth_training/val.jsonll
 ```
 
 ### `configs/inference_depth.yaml`
@@ -269,24 +491,24 @@ conda activate loradapter
 
 Dry run on 3 images first:
 ```powershell
-python pre_depth_calculations.py --data_dir data/ --dry_run_n 3
+python depth_map_calculations.py --data_dir data/ --dry_run_n 3
 ```
 Success: no errors; depth PNGs in `data/raw_depth/`.
 
 Full run:
 ```powershell
-python pre_depth_calculations.py --data_dir data/
+python depth_map_calculations.py --data_dir data/
 ```
 Success:
 - `data/raw_depth/` populated (one PNG per image)
-- `data/depth_training/train.json`, `val.json`, `test.json` written
+- `data/depth_training/train.jsonll`, `val.jsonl`, `test.jsonl` written
 - Verification output shows `0 failures`
 - Dataset sizes: 639 train / 137 val / 137 test
 
 ### Stage B — Training
 
 ```powershell
-python train_depth.py experiment=train_depth
+python depth_training.py experiment=train_depth
 ```
 
 Expected startup log:
@@ -315,7 +537,7 @@ Expected tags (confirmed by execution):
 ### Stage B — Inference
 
 ```powershell
-python inference_depth.py \
+python depth_inference.py \
   ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model \
   inference.input_dir=data/raw
 ```
@@ -328,7 +550,7 @@ Success: 4-panel JPG grids written to `outputs/inference/depth/`.
 
 1. **`max_train_steps` does not stop training**: Setting `+max_train_steps=N` via Hydra affects the progress-bar total and LR scheduler warmup calculation only. The batch loop runs for the full number of epochs. To stop early, send SIGINT (Ctrl+C); the signal handler finishes the current step and saves a final checkpoint.
 
-2. **Triplication risk in preprocessing**: The depth preprocessing transform chain (SquarePad → Resize → ToTensor → Normalize) is defined in three separate places (`pre_depth_calculations.py`, `inference_depth.py`, `configs/data/local_depth.yaml`). Any future change must be applied to all three simultaneously or parity will break.
+2. **Triplication risk in preprocessing**: The depth preprocessing transform chain (SquarePad → Resize → ToTensor → Normalize) is defined in three separate places (`depth_map_calculations.py`, `depth_inference.py`, `configs/data/local_depth.yaml`). Any future change must be applied to all three simultaneously or parity will break.
 
 3. **Per-image min-max depth**: Depth values are normalised per image. You cannot meaningfully compare depth magnitudes across images. The pipeline learns a structural prior, not a metric depth prior.
 
@@ -338,4 +560,215 @@ Success: 4-panel JPG grids written to `outputs/inference/depth/`.
 
 6. **OOM with experiment defaults on consumer GPU**: Experiment config uses `batch_size=4`, `gradient_accumulation_steps=4`, `gradient_checkpointing=True`, `bf16=True`. On a GPU with less than 16 GB VRAM this may OOM during backward. Use `data.batch_size=1 gradient_accumulation_steps=1` for single-GPU runs.
 
-7. **No test-time evaluation script**: `test.json` exists but there is no built-in script to run batch inference on the test split and compute quantitative metrics. `inference_depth.py` with `save_generated_only=true` produces images but not scores.
+7. **No test-time evaluation script**: `test.jsonl` exists but there is no built-in script to run batch inference on the test split and compute quantitative metrics. `depth_inference.py` with `save_generated_only=true` produces images but not scores.
+
+---
+
+## 9 · Full Parameter Control
+
+Everything you can tune, where it lives, and what changing it does. One place to look up any flag.
+
+---
+
+### 9.1 How Hydra overrides work
+
+`depth_training.py` and `depth_inference.py` use [Hydra](https://hydra.cc) for configuration. The base config is `configs/train_depth.yaml`; the experiment overrides live in `configs/experiment/train_depth.yaml`. You can override ANY key at the command line without editing a file:
+
+```powershell
+# Single override
+python depth_training.py experiment=train_depth epochs=3
+
+# Multiple overrides
+python depth_training.py experiment=train_depth epochs=3 val_steps=100 data.batch_size=2
+
+# Nested keys use dot notation
+python depth_training.py experiment=train_depth data.batch_size=1 lora.struct.ckpt_path=outputs/train/.../step1000
+
+# Adding a new key that is not in any config (use + prefix)
+python depth_training.py experiment=train_depth +max_train_steps=500
+```
+
+Hydra writes its own log + a copy of the resolved config to:
+- `outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/.hydra/config.yaml` — what actually ran
+- `outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/.hydra/overrides.yaml` — what you passed on the CLI
+
+If something behaves unexpectedly, read `config.yaml` — it shows every key's final resolved value.
+
+---
+
+### 9.2 Stage A — `depth_map_calculations.py` CLI flags
+
+Run once before training to precompute depth PNGs from raw images.
+
+```powershell
+python depth_map_calculations.py --data_dir data/ [flags]
+```
+
+| Flag | Default | What it does | When to change |
+|------|---------|--------------|----------------|
+| `--data_dir` | *(required)* | Folder containing `train.jsonl`, `val.jsonl`, `test.jsonl`. The script scans for files whose names contain "train"/"val"/"test" — non-default names like `my_train.jsonl` are found automatically. | Always set this. |
+| `--dry_run_n N` | off | Process only the first N images per split. Run with `--dry_run_n 3` first, check output, then run without it. | Always use before first full run. |
+| `--size` | `512` | Square side for saved depth PNGs. Must match `size` in your training config. If you change this you must rerun Stage A. | Keep 512 unless you change training resolution. |
+| `--batch_size` | `4` | Images fed to the depth model at once. Higher = faster but uses more GPU memory. | Lower if you get OOM during Stage A. |
+| `--model` | `checkpoints/local_models/dpt-hybrid-midas` | Path to the local DPT model folder OR a HuggingFace repo ID. Default is the local offline copy. | Only change if you switch depth models (breaks parity with existing depth PNGs — delete `data/raw_depth/` and rerun). |
+| `--local_files_only` | `True` | `True` = load model from local disk only (offline). `False` = allow HF download if model is not cached. | Set to `False` if you need to download the model for the first time. |
+| `--device` | `cuda` if available | `cuda` or `cpu`. | Set to `cpu` if no GPU available (very slow). |
+| `--no_skip` | off | Re-compute depth maps even if PNG already exists. By default existing PNGs are reused (fast). | Add this flag if you changed `--model` or `--size` and need to regenerate. |
+| `--raw_dir` | `<data_dir>/raw` | Root of raw image tree. Mirror structure is preserved: `raw/000417/img.jpg` → `raw_depth/000417/img.png`. | Only if your images are not under `<data_dir>/raw/`. |
+| `--depth_dir` | `<data_dir>/raw_depth` | Where depth PNGs are saved. | Only to redirect output location. |
+| `--output_dir` | `<data_dir>/depth_training` | Where the output `train.jsonl`, `val.jsonl`, `test.jsonl` are written. | Only to redirect manifest location. |
+
+---
+
+### 9.3 Stage B Training — `configs/experiment/train_depth.yaml`
+
+All training behaviour is controlled from here. Override any key on the command line (see §9.1).
+
+#### Resolution and hardware
+
+| Key | Default (experiment) | What it does | Impact of changing |
+|-----|---------------------|--------------|-------------------|
+| `size` | `512` | Square canvas size. Must match the size used in Stage A. | Changing requires rerunning Stage A AND deletes training parity. Do not change mid-training. |
+| `bf16` | `true` | Brain-float16 mixed precision. Cuts VRAM by ~40%, minimal quality loss on modern GPUs. | Set `false` if your GPU does not support bf16 (older cards). Training becomes slower and heavier. |
+| `gradient_checkpointing` | `true` | Trade compute for memory: recomputes activations during backward instead of storing them. Saves ~1.5 GB VRAM, slows backward ~20%. | Set `false` if you have plenty of VRAM and want faster training. Required for 12 GB GPUs. |
+| `gradient_accumulation_steps` | `4` | How many micro-batches to accumulate before one optimizer step. Effective batch = `data.batch_size x gradient_accumulation_steps`. | Reduce if training is too slow and you have VRAM to spare. Increase if you want a larger effective batch without more VRAM. |
+| `data.batch_size` | `4` | Per-GPU micro-batch size. | Reduce to `1` or `2` if you OOM. On a 24 GB GPU you can use `8`. |
+| `data.workers` | `4` | DataLoader worker processes. | Set `0` on Windows if you get multiprocessing errors. |
+
+#### Learning rate and schedule
+
+| Key | Default | What it does | Impact of changing |
+|-----|---------|--------------|-------------------|
+| `learning_rate` | `1e-4` | Peak AdamW learning rate. | Too high (>5e-4): loss spikes and diverges. Too low (<1e-5): very slow convergence. |
+| `lr_scheduler` | `cosine` | LR decay schedule after warmup. `cosine` decays smoothly to ~0; `constant` holds the peak LR throughout. | Use `constant` for a quick test; `cosine` for production runs (better final quality). |
+| `lr_warmup_steps` | `500` | Steps where LR ramps from 0 up to `learning_rate`. Prevents early instability. | Reduce if your dataset is small and 500 steps is a large fraction of total training. Set `0` to disable. |
+
+#### When to save / validate
+
+| Key | Default | What it does | Impact of changing |
+|-----|---------|--------------|-------------------|
+| `epochs` | `5` | Total training passes over the dataset. | More epochs = more training time and potentially better quality, but also risk of overfitting. Watch val/loss — if it rises while train/loss falls, stop earlier. |
+| `val_steps` | `500` | Every N optimizer steps: compute val/loss on held-out data + update `best_model/` if improved. Cheap (no image generation). | Lower = more frequent val/loss updates in TensorBoard. Higher = faster training throughput. |
+| `ckpt_steps` | `1000` | Every N optimizer steps: save weights + generate N monitoring images. Heavy (runs the diffusion model). | Lower = more disk usage + slower overall training. Reasonable range: 500–2000 for a 5-epoch run. |
+| `val_batches` | `64` | How many val batches to average for val/loss. More = more accurate estimate but slower. | Reduce to `4`–`8` for smoke tests. Keep `64` for real runs. |
+
+#### Checkpoint monitoring grid (the 50/50 split)
+
+| Key | Default | What it does | Impact of changing |
+|-----|---------|--------------|-------------------|
+| `n_grid_images` | `10` | Total images in each checkpoint's monitoring grid. Split 50/50: `n_grid_images // 2` are **fixed** (same scenes every checkpoint), the remaining half are **fresh** (re-randomized each checkpoint). | More = more disk use and slower checkpoint saves. Even number recommended (clean 50/50 split). Minimum 2. |
+| `grid_include_empty_prompt` | `false` | When `true`, each monitoring image gets a 4th panel: generation with **empty prompt** (pure depth conditioning, no text). Useful for seeing how much the model leans on the depth map vs the prompt. | `true` doubles image generation time per checkpoint. Set `true` for diagnostic runs; keep `false` for speed. |
+
+The fixed half: chosen **once at training start** using OS entropy (different each run). Stored in `_fixed_val_idxs`. Every checkpoint at `step1000`, `step2000`, `step3000` shows these **same scenes** so you can directly compare how the model improves. Files are named `sample_00_fixed.jpg` … `sample_04_fixed.jpg`.
+
+The fresh half: re-drawn at each checkpoint from the remaining val indices (never overlaps the fixed half). Files are named `sample_05_new.jpg` … `sample_09_new.jpg`. Quickly checks generalization to unseen scenes.
+
+#### Dataset and model paths
+
+| Key | Default | What it does | When to change |
+|-----|---------|--------------|----------------|
+| `data.json_file` | `data/depth_training/train.jsonl` | Training manifest. Each line: `{raw_image_path, depth_path, prompt}`. | Change to point at a different JSONL if your dataset is elsewhere. |
+| `data.val_json_file` | `data/depth_training/val.jsonl` | Validation manifest. **Never use `test.jsonl` here** — test split must stay uncontaminated. | Only change to use a different val set. |
+| `data.image_root` | `null` (= repo root) | Base path prepended to relative `raw_image_path` values in the JSONL. Set to `/mnt/dataset` when images are on a different drive or machine. | **Required when training on Ubuntu with images at a different path from where you generated the JSONL.** |
+| `local_files_only` | `true` | `true` = load all models from local disk (fully offline). `false` = allow HF downloads. | Keep `true` for training. |
+| `base_model_path` | `checkpoints/local_models/stable-diffusion-v1-5` | Local path to SD1.5. | Only if you moved the model. |
+| `depth_model_path` | `checkpoints/local_models/dpt-hybrid-midas` | Local path to DPT. | Only if you moved the model. |
+| `lora.struct.ckpt_path` | `null` | Resume from a previous checkpoint. Set to e.g. `outputs/train/depth/runs/.../step2000`. | Use when continuing an interrupted training run. |
+| `seed` | `42` | Random seed for training noise. Does **not** affect the fixed monitoring image selection (that uses OS entropy). | Change if you want to run multiple experiments with different initialization. |
+| `prompt` | `null` | If set, overrides every image's caption with this single string. | Use for single-concept fine-tuning where all images share one prompt. |
+| `tag` | `depth` | Written into the TensorBoard event filename and used as the output subfolder name. | Change if running multiple experiments to keep outputs separated. |
+| `ignore_check` | `true` | Skip the startup data-integrity pre-check (verifies every JSONL entry exists on disk). Skipping saves ~30 seconds. | Set `false` if you suspect your JSONL has stale paths. |
+
+---
+
+### 9.4 Stage B Inference — `configs/inference_depth.yaml`
+
+```powershell
+# From a JSONL manifest (recommended for batch runs):
+python depth_inference.py \
+  ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model \
+  inference.json_file=data/depth_training/test.jsonl
+
+# Single image:
+python depth_inference.py \
+  ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model \
+  "inference.images=[data/raw/000417/raw_image.jpg]" \
+  "inference.prompts=['a driving scene at night in the rain']"
+```
+
+| Key | Default | What it does | When to change |
+|-----|---------|--------------|----------------|
+| `ckpt_path` | *(required)* | Path to a checkpoint folder containing `struct/lora-checkpoint.pt` + `struct/mapper-checkpoint.pt`. Usually `best_model/` or a specific `checkpoint-epoch1/step1000/`. | Always set. Use `best_model/` for final evaluation. Use step checkpoints to compare across training. |
+| `inference.json_file` | `null` | JSONL file to run inference on. Each line needs `raw_image_path` and `prompt`. | Use `test.jsonl` for final held-out evaluation. Never use `val.jsonl` or `train.jsonl` here (contamination). |
+| `inference.images` | `[]` | Direct list of image paths (alternative to json_file). | For quick single-image tests. |
+| `inference.prompts` | `[]` | Prompts for the images list. Must match length of `inference.images`. | Required when using `inference.images`. |
+| `inference.output_dir` | `outputs/inference/depth/results` | Where to save generated images. Resolved from repo root (absolute paths also accepted). | Change to organize results per experiment. |
+| `inference.save_generated_only` | `false` | `false` = save 4-panel grid + individual panels (original, depth, predicted, raw-depth-gen). `true` = save only the predicted image, preserving the folder structure from the JSONL. | Set `true` for clean batch evaluation where you only need the generated images. |
+| `inference.n_samples` | `1` | How many images to generate per input. | `2`–`4` for diversity comparison. Multiplies inference time. |
+| `inference.num_inference_steps` | `50` | Diffusion denoising steps. More = slower but sharper. | `20` for fast preview, `50` for quality, `100` for maximum quality (diminishing returns above 80). |
+| `inference.guidance_scale` | `7.5` | CFG scale: how strictly the model follows the text prompt. Higher = more prompt-driven, less variation. | `3`–`5` for creative / more variation. `7.5` standard. `12`–`15` for very tight prompt adherence. |
+| `size` | `512` | Must match the size used during training. | Do not change. |
+| `local_files_only` | `true` | Offline model loading. | Keep `true` after first download. |
+
+---
+
+### 9.5 Common scenarios — exact commands
+
+#### Smoke test (verify pipeline works, ~5 minutes)
+```powershell
+python depth_map_calculations.py --data_dir data/ --dry_run_n 3
+
+python depth_training.py experiment=train_depth `
+  epochs=1 val_steps=10 ckpt_steps=20 val_batches=4 n_grid_images=2 `
+  "data.workers=0" ignore_check=true
+```
+
+#### Full training run (Ubuntu, 5 epochs)
+```bash
+python depth_training.py experiment=train_depth
+```
+
+#### Resume interrupted training
+```powershell
+python depth_training.py experiment=train_depth `
+  "lora.struct.ckpt_path=outputs/train/depth/runs/2026-07-01/00-41-13/checkpoint-epoch2/step4000"
+```
+
+#### Reduce memory (OOM on a 12 GB GPU)
+```powershell
+python depth_training.py experiment=train_depth data.batch_size=1 gradient_accumulation_steps=4
+```
+
+#### Images on a different drive (Ubuntu training with images at /mnt/data)
+```bash
+python depth_training.py experiment=train_depth data.image_root=/mnt/data
+```
+The JSONL has paths like `data/raw/000417/raw_image.jpg`. With `image_root=/mnt/data`, the dataset resolves each path to `/mnt/data/data/raw/000417/raw_image.jpg`. So keep the JSONL relative paths as-is and just point `image_root` at the drive root that makes them correct.
+
+#### More monitoring images per checkpoint (watch 10 fixed scenes)
+```powershell
+python depth_training.py experiment=train_depth n_grid_images=20
+# → 10 fixed + 10 fresh scenes per checkpoint grid
+```
+
+#### Add empty-prompt panel to see pure depth conditioning
+```powershell
+python depth_training.py experiment=train_depth grid_include_empty_prompt=true
+# Each monitoring image gets a 4th panel: generated with empty prompt
+```
+
+#### Evaluate on test split after training
+```powershell
+python depth_inference.py `
+  ckpt_path=outputs/train/depth/runs/YYYY-MM-DD/HH-MM-SS/best_model `
+  inference.json_file=data/depth_training/test.jsonl `
+  inference.save_generated_only=true `
+  inference.output_dir=outputs/inference/depth/test_eval
+```
+
+#### Generate comparison report
+```powershell
+python training_report.py
+python training_report.py --markdown   # GitHub-flavoured Markdown
+```
+

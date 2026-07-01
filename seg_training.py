@@ -1,10 +1,10 @@
 """
-train_seg.py
+seg_training.py
 ------------
 STAGE D — train the segmentation-conditioned LoRAdapter on PRE-SAVED Cityscapes
-colour maps. This is the segmentation twin of train_depth.py.
+colour maps. This is the segmentation twin of depth_training.py.
 
-STRUCTURE: this file is a deliberate line-for-line mirror of train_depth.py, with
+STRUCTURE: this file is a deliberate line-for-line mirror of depth_training.py, with
 exactly three categories of change:
   1. "depth" -> "seg" in names and keys (batch["seg"] not batch["depth"],
      cfg.seg_model_name/path not cfg.depth_model_name/path, panel labels).
@@ -337,6 +337,26 @@ def main(cfg):
     logger.info(f"Encoder params: {sum(p.numel() for p in encoder_params):,}")
     logger.info(f"LoRA params:    {sum(p.numel() for p in model.params_to_optimize):,}")
 
+    # ── SEGMENTATION TRAINING STARTUP BANNER ──────────────────────────────────
+    # Printed once at launch so you can identify this run at a glance in the log
+    # file, distinguish it from a depth run, and know exactly where to point TensorBoard.
+    if accelerator.is_main_process:
+        tb_dir = output_path / "logs" / "tensorboard"
+        logger.info("")
+        logger.info("=" * 64)
+        logger.info("  PIPELINE   :  SEGMENTATION  (SegFormer-b5 Cityscapes conditioning)")
+        logger.info(f"  Output     :  {output_path}")
+        logger.info(f"  TensorBoard:  tensorboard --logdir \"{tb_dir}\"")
+        logger.info(f"  Train      :  {len(dm.train_dataset):,} images  |  Val: {len(dm.val_dataset):,} images")
+        logger.info(f"  Schedule   :  {cfg.epochs} epochs x {num_update_steps_per_epoch} steps = {max_train_steps} total optimizer steps")
+        logger.info(f"  LR         :  {cfg.learning_rate}  scheduler={cfg.lr_scheduler}  warmup={cfg.get('lr_warmup_steps', 0)} steps")
+        logger.info(f"  val_steps  :  {cfg.val_steps}  (val/loss + best_model update)")
+        logger.info(f"  ckpt_steps :  {cfg.ckpt_steps}  (weights + {cfg.get('n_grid_images', 10)} grid images saved)")
+        logger.info(f"  TensorBoard scalars: train/loss  train/lr  train/grad_norm  train/epoch  val/loss")
+        logger.info(f"  TensorBoard images : val/sample_00 … val/sample_{cfg.get('n_grid_images', 10) - 1:02d}  (ORIGINAL | SEG MAP | PREDICTED)")
+        logger.info("=" * 64)
+        logger.info("")
+
     if accelerator.is_main_process:
         # Keep personal identifiers OUT of the tensorboard event filename.
         # Override gethostname with the experiment tag (matches depth's approach).
@@ -495,14 +515,16 @@ def main(cfg):
                 )
 
     # ── Training loop ──────────────────────────────────────────────────────────
-    logger.info("start segmentation training")
+    logger.info("[SEG] start segmentation training")
     for epoch in range(cfg.epochs):
-        logger.info(f"epoch {epoch + 1}")
+        logger.info(f"[SEG] Epoch {epoch + 1}/{cfg.epochs} started  (global_step={global_step})")
         unet.train()
         for m in mappers:  m.train()
         for e in encoders: e.train()
 
         for step, batch in enumerate(train_dataloader):
+            _grad_norm = None   # only set on true optimizer steps (sync_gradients=True)
+
             with accelerator.accumulate(unet, *mappers, *encoders):
                 imgs = batch["jpg"].to(accelerator.device).clip(-1.0, 1.0)
                 B    = imgs.shape[0]
@@ -533,7 +555,11 @@ def main(cfg):
 
                 if accelerator.sync_gradients:
                     all_params = [p for g in optimizer.param_groups for p in g["params"]]
-                    accelerator.clip_grad_norm_(all_params, max_norm=1.0)
+                    # clip_grad_norm_ returns the total norm BEFORE clipping — log it
+                    # to detect instability: spiky/high values mean the model is
+                    # struggling; a smoothly decreasing norm means healthy convergence.
+                    _g = accelerator.clip_grad_norm_(all_params, max_norm=1.0)
+                    _grad_norm = float(_g)
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -541,9 +567,21 @@ def main(cfg):
 
             loss_val = loss.detach().item()
             lr_val   = lr_scheduler.get_last_lr()[0]
-            progress_bar.set_postfix(loss=loss_val, lr=lr_val, refresh=False)
-            # TensorBoard tags namespaced train/ vs val/ (val/* set in do_segmentation_validation)
-            accelerator.log({"train/loss": loss_val, "train/lr": lr_val}, step=global_step)
+            # epoch as a float (e.g. 2.5 = halfway through epoch 3) so TensorBoard
+            # shows epoch boundaries without having to manually count steps.
+            epoch_frac = epoch + step / max(len(train_dataloader), 1)
+            log_dict = {
+                "train/loss":  loss_val,
+                "train/lr":    lr_val,
+                "train/epoch": epoch_frac,
+            }
+            if _grad_norm is not None:
+                # Only logged on true optimizer steps (not gradient-accumulation micro-steps).
+                # What to watch: starts high (~1.0 at clip), drops over training.
+                # Red flag: stays above 1.0 for many steps, or spikes repeatedly.
+                log_dict["train/grad_norm"] = _grad_norm
+            progress_bar.set_postfix(loss=loss_val, lr=f"{lr_val:.2e}", gnorm=f"{_grad_norm or 0:.3f}", refresh=False)
+            accelerator.log(log_dict, step=global_step)
 
             if accelerator.sync_gradients:
                 progress_bar.update(1)

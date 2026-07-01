@@ -1,6 +1,6 @@
 # configs/inference_seg.yaml
 # --------------------------
-# Base config for inference_seg.py — the segmentation twin of inference_depth.yaml.
+# Base config for seg_inference.py — the segmentation twin of inference_depth.yaml.
 #
 # Loads a trained segmentation-conditioned LoRAdapter checkpoint and generates
 # images conditioned on the LIVE SegFormer-b5-Cityscapes segmentation of each input.
@@ -9,18 +9,18 @@
 #   - SegmentationEncoder (the seg encoder) runs automatically inside model.sample()
 #     (sample_easy calls encoder(c) — no skip_encode), so segmentation is computed
 #     LIVE at inference. You do NOT need pre-computed maps at inference time.
-#   - The preprocess used here (build_seg_square_preprocess in inference_seg.py) is
-#     IDENTICAL to the one used by calculate_segmentation_map.py, guaranteeing that
+#   - The preprocess used here (build_seg_square_preprocess in seg_inference.py) is
+#     IDENTICAL to the one used by seg_map_calculations.py, guaranteeing that
 #     the live seg map matches the saved training map (train/inference parity).
 #
 # USAGE — from a JSON manifest (recommended):
-#   python inference_seg.py \
+#   python seg_inference.py \
 #       ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/checkpoint-3000 \
-#       inference.json_file=data/seg_training/test.json \
+#       inference.json_file=data/seg_training/test.jsonl \
 #       inference.output_dir=results/seg
 #
 # USAGE — single image:
-#   python inference_seg.py \
+#   python seg_inference.py \
 #       ckpt_path=outputs/train/seg/runs/YYYY-MM-DD/HH-MM-SS/checkpoint-3000 \
 #       "inference.images=[data/raw/000417/raw_image.jpg]" \
 #       "inference.prompts=['driving in rain at night']" \
@@ -41,7 +41,7 @@ defaults:
   - _self_
 
 # ---- Checkpoint -----------------------------------------------------------
-# Path to the checkpoint directory produced by train_seg.py.
+# Path to the checkpoint directory produced by seg_training.py.
 # Structure expected:  <ckpt_path>/struct/lora-checkpoint.pt
 #                      <ckpt_path>/struct/mapper-checkpoint.pt
 ckpt_path: ???     # e.g. outputs/train/seg/runs/2024-01-01/00-00-00/checkpoint-3000
@@ -58,7 +58,7 @@ seed: 42
 # Both the local folder AND the hub id are listed; the flag picks which.
 #   local_files_only: true   -> use LOCAL folders (*_model_path), offline.
 #   local_files_only: false  -> use HUB ids (*_model_name); download if missing.
-# The choice is made in inference_seg.py (reads this flag, sets model.model_name
+# The choice is made in seg_inference.py (reads this flag, sets model.model_name
 # / encoder.model before the model is built). Local paths are relative to the repo
 # root; the code makes them absolute.
 local_files_only: true
@@ -72,7 +72,7 @@ seg_model_path: checkpoints/local_models/segformer-b5-cityscapes
 
 # ---- Base diffusion model -------------------------------------------------
 model:
-  model_name: ${base_model_name}   # default; inference_seg.py overrides to base_model_path when local_files_only=true
+  model_name: ${base_model_name}   # default; seg_inference.py overrides to base_model_path when local_files_only=true
 
 # ---- LoRA (inference mode — weights not updated) --------------------------
 lora:
@@ -80,7 +80,7 @@ lora:
     optimize: false   # frozen at inference
     encoder:
       # LIVE seg encoder at inference — same model the training maps were computed with.
-      model: ${seg_model_name}   # default; inference_seg.py overrides to seg_model_path when local_files_only=true
+      model: ${seg_model_name}   # default; seg_inference.py overrides to seg_model_path when local_files_only=true
 
 # ---- Inference parameters -------------------------------------------------
 inference:
@@ -91,12 +91,12 @@ inference:
   prompts:   []         # prompts for 'images' list mode; leave empty to use JSON prompts
 
   # Output:
-  output_dir: results_seg      # directory where output images are saved
+  output_dir: outputs/inference/seg/results     # relative to repo root (resolved in seg_inference.py)
   save_generated_only: false   # true → save only predicted image, mirroring folder structure
 
   # Preprocessing:
   resize_mode: letterbox       # letterbox (default) | stretch — squaring before encoder
-                               # Must match the mode used in calculate_segmentation_map.py
+                               # Must match the mode used in seg_map_calculations.py
 
   # Generation:
   n_samples:           1    # number of generated images per input image
@@ -105,6 +105,6 @@ inference:
 
 hydra:
   run:
-    dir: outputs/inference_seg/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/inference/seg/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
   job:
     chdir: true

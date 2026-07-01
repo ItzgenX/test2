@@ -21,7 +21,7 @@ genuinely demands it — two seg-specific points, both critical:
      class ids is meaningless: the mean of "road"=0 and "car"=13 is 6.5, which is
      "traffic light" — a fabricated class that doesn't exist in the image. NEAREST
      preserves exact labels. In practice the PNG is already at the right size (saved
-     by calculate_segmentation_map.py at cfg.size), so this resize is usually a
+     by seg_map_calculations.py at cfg.size), so this resize is usually a
      no-op alignment step — but we still force NEAREST so it is correct for any size
      and never silently corrupts labels.
 
@@ -31,7 +31,7 @@ Returned by __getitem__:
     "seg"    : colour map   [3, H, W] in [0, 1]    (Cityscapes-palette RGB)
     "caption": prompt string
   }
-The "seg" key parallels depth's "depth" key so train_seg.py reads batch["seg"].
+The "seg" key parallels depth's "depth" key so seg_training.py reads batch["seg"].
 """
 
 import json
@@ -51,8 +51,9 @@ class SegJsonDataset(Dataset):
     """
     Load image + pre-computed segmentation-ID map pairs from a JSON manifest.
 
-    MANIFEST FORMAT (written by calculate_segmentation_map.py):
-        [{"raw_image_path": "...jpg", "seg_path": "...png", "prompt": "..."}, ...]
+    JSONL format — one JSON object per line (written by seg_map_calculations.py):
+        {"raw_image_path": "...jpg", "seg_path": "...png", "prompt": "..."}
+        {"raw_image_path": "...jpg", "seg_path": "...png", "prompt": "..."}
 
     Paths resolve: absolute as-is, else relative to project_root, else to json_dir.
     This mirrors the depth dataset's path resolution exactly.
@@ -65,10 +66,12 @@ class SegJsonDataset(Dataset):
         size: int = 512,           # square side for the conditioning colour map
         project_root: Path = None,
         palette: list = None,      # class-id -> RGB; defaults to Cityscapes SSOT
+        image_root: Path = None,
     ):
         self.json_file    = Path(json_file)
         self.json_dir     = self.json_file.parent
         self.project_root = Path(project_root) if project_root else self.json_dir
+        self.image_root   = Path(image_root) if image_root else None
         self.size         = size
         self.image_transform = image_transform
 
@@ -81,7 +84,7 @@ class SegJsonDataset(Dataset):
         self.num_classes  = self.seg_palette.shape[0]   # 19 for Cityscapes
 
         with open(self.json_file, "r", encoding="utf-8") as f:
-            self.items = json.load(f)
+            self.items = [json.loads(line) for line in f if line.strip()]
 
         # Early, loud missing-file check — catch a bad manifest before the
         # dataloader workers surface a confusing deep stack trace mid-training.
@@ -98,7 +101,7 @@ class SegJsonDataset(Dataset):
         if missing_seg:
             print(
                 f"[SegJsonDataset] {missing_seg}/{len(self.items)} entries missing "
-                f"seg_path. Run: python calculate_segmentation_map.py --data_dir data/"
+                f"seg_path. Run: python seg_map_calculations.py --data_dir data/"
             )
 
     def _seg_resolve(self, p: str) -> Path:
@@ -111,6 +114,10 @@ class SegJsonDataset(Dataset):
         p = Path(p)
         if p.is_absolute():
             return p
+        if self.image_root:
+            abs_p = self.image_root / p
+            if abs_p.exists():
+                return abs_p
         abs_p = self.project_root / p
         return abs_p if abs_p.exists() else self.json_dir / p
 
@@ -155,7 +162,7 @@ class SegJsonDataset(Dataset):
         if "seg_path" not in item:
             raise KeyError(
                 f"Entry {idx} in {self.json_file.name} has no 'seg_path'. "
-                f"Run calculate_segmentation_map.py --data_dir data/ to build JSONs."
+                f"Run seg_map_calculations.py --data_dir data/ to build JSONs."
             )
         seg = self._load_seg_colormap(self._seg_resolve(item["seg_path"]))
 
@@ -167,7 +174,7 @@ class SegJsonDataModule:
     Data module reading a JSON manifest for train + optional validation.
 
     Twin of DepthJsonDataModule. Exposes train_dataloader()/val_dataloader() and
-    .train_dataset / .val_dataset (train_seg.py indexes val_dataset directly for
+    .train_dataset / .val_dataset (seg_training.py indexes val_dataset directly for
     the fixed-scene monitoring images). val_json_file MUST point at the real
     validation set — NEVER test.json (references.md §8).
     """
@@ -183,10 +190,12 @@ class SegJsonDataModule:
         workers: int = 4,
         val_workers: int = 2,
         palette: list = None,
+        image_root: str = None,
     ):
         # project_root: three levels up from this file (src/data/ -> src/ -> root).
         project_root = Path(os.path.abspath(__file__)).parent.parent.parent
         image_tfm    = transforms.Compose(transform)
+        _img_root    = Path(project_root, image_root) if image_root else project_root
 
         self.batch_size     = batch_size
         self.val_batch_size = val_batch_size
@@ -196,14 +205,14 @@ class SegJsonDataModule:
         self.train_dataset = SegJsonDataset(
             json_file=Path(project_root, json_file),
             image_transform=image_tfm, size=size,
-            project_root=project_root, palette=palette,
+            project_root=_img_root, palette=palette,
         )
 
         if val_json_file:
             self.val_dataset = SegJsonDataset(
                 json_file=Path(project_root, val_json_file),
                 image_transform=image_tfm, size=size,
-                project_root=project_root, palette=palette,
+                project_root=_img_root, palette=palette,
             )
         else:
             # No val set provided -> fall back to train set.

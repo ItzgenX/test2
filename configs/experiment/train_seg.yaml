@@ -78,9 +78,9 @@ data:
   workers:        4
   val_workers:    2
   # DIFF: seg_training/ (was depth_training/).
-  # Built by: python calculate_segmentation_map.py --data_dir data/
-  json_file:     data/seg_training/train.json
-  val_json_file: data/seg_training/val.json   # NEVER test.json here (references.md §8)
+  # Built by: python seg_map_calculations.py --data_dir data/
+  json_file:     data/seg_training/train.jsonl
+  val_json_file: data/seg_training/val.jsonl   # NEVER test.jsonl here (references.md §8)
 
 # =============================================================================
 # 3. GLOBAL FALLBACK PROMPT  (identical to depth)

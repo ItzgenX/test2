@@ -1,10 +1,10 @@
 """
-calculate_segmentation_map.py
+seg_map_calculations.py
 -----------------------------
 STAGE C — pre-compute and CACHE semantic-segmentation maps for training images
 using SegFormer-b5-Cityscapes, then build seg_training/{train,val,test}.json.
 
-This is the segmentation twin of pre_depth_calculations.py. It mirrors that
+This is the segmentation twin of depth_map_calculations.py. It mirrors that
 script's STRUCTURE (relative-path-preserving output tree, one-pass atomic JSON
 building, loud self-verification) but is a SEPARATE file — depth and segmentation
 never share a calculation file (references.md §6). The seg-specific differences
@@ -28,10 +28,10 @@ LOCKED MODEL: nvidia/segformer-b5-finetuned-cityscapes-1024-1024
 
 TYPICAL WORKFLOW (data_dir mode — recommended, mirrors depth):
   # builds data/seg_training/{train,val,test}.json from data/{train,val,test}.json
-  python calculate_segmentation_map.py --data_dir data/
+  python seg_map_calculations.py --data_dir data/
 
   # then train:
-  python train_seg.py experiment=train_seg
+  python seg_training.py experiment=train_seg
 
 JSON ENTRY FORMAT produced:
   {"raw_image_path": "data/raw/000417/raw_image.jpg",
@@ -71,7 +71,7 @@ def parse_bool(value):
 
 
 # ============================================================================ #
-#  HELPERS (mirrors pre_depth_calculations.py — adapted, not copy-pasted)      #
+#  HELPERS (mirrors depth_map_calculations.py — adapted, not copy-pasted)      #
 # ============================================================================ #
 
 def _get_source_key(entry: dict) -> str:
@@ -136,7 +136,7 @@ def precompute_segmentation_maps(
     Notes:
       • RGB preprocessing uses build_seg_square_preprocess() — the SHARED function
         from src/data/transforms.py — so it is byte-identical to what
-        inference_seg.py will use. This is what guarantees train/inference parity.
+        seg_inference.py will use. This is what guarantees train/inference parity.
       • encoder.label_ids() returns raw class IDs; we save them as PIL mode "L"
         (8-bit grayscale, values 0..num_classes-1). Colour palette is applied
         later, at load time, by SegJsonDataset._load_seg_colormap().
@@ -161,7 +161,7 @@ def precompute_segmentation_maps(
 
     # ---- SHARED RGB preprocessing ----------------------------------------- #
     # build_seg_square_preprocess is the SINGLE SOURCE OF TRUTH for squaring.
-    # Using it here (offline calc) AND in inference_seg.py (live inference) is
+    # Using it here (offline calc) AND in seg_inference.py (live inference) is
     # what guarantees the seg map the network sees at inference matches the
     # map saved for training. Do not inline this or duplicate it.
     preprocess = build_seg_square_preprocess(size=size, resize_mode=resize_mode)
@@ -233,11 +233,11 @@ def precompute_segmentation_maps(
     return path_to_seg
 
 
-def _verify_segmentation_training_json(
-    json_path: Path, num_classes: int
+def _verify_segmentation_training_jsonl(
+    jsonl_path: Path, num_classes: int
 ) -> tuple[int, int]:
     """
-    Verify every entry in a seg-training output JSON.
+    Verify every entry in a seg-training output JSONL file.
 
     The "segmentation" in the name satisfies the visual-identity rule.
 
@@ -253,8 +253,8 @@ def _verify_segmentation_training_json(
     Returns (n_passed, n_failed) and prints a one-line PASS/FAIL summary.
     """
     cwd = Path.cwd()
-    with open(json_path, "r", encoding="utf-8") as f:
-        entries = json.load(f)
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
 
     passed = failed = 0
     for i, entry in enumerate(entries):
@@ -297,9 +297,25 @@ def _verify_segmentation_training_json(
         passed += 1
 
     status = "PASS" if failed == 0 else "FAIL"
-    print(f"  [{status}] {json_path.name}: {passed}/{len(entries)} entries valid"
+    print(f"  [{status}] {jsonl_path.name}: {passed}/{len(entries)} entries valid"
           + (f", {failed} FAILED" if failed else ""))
     return passed, failed
+
+
+def _find_split_jsonl(data_dir: Path, split: str) -> "Path | None":
+    """
+    Locate the JSONL file for a given split in data_dir.
+    Exact match first (data_dir/{split}.jsonl), then any *.jsonl whose stem
+    contains the split name; among those pick the shortest stem.
+    """
+    exact = data_dir / f"{split}.jsonl"
+    if exact.exists():
+        return exact
+    candidates = sorted(
+        [p for p in data_dir.glob("*.jsonl") if split.lower() in p.stem.lower()],
+        key=lambda p: len(p.stem),
+    )
+    return candidates[0] if candidates else None
 
 
 def build_segmentation_training_jsons(
@@ -317,7 +333,7 @@ def build_segmentation_training_jsons(
     local_files_only: bool = True,
 ) -> None:
     """
-    Build data/seg_training/{train,val,test}.json from data/{train,val,test}.json.
+    Build data/seg_training/{train,val,test}.jsonl from data/{train,val,test}.jsonl.
 
     The "segmentation" in the name satisfies the visual-identity rule.
 
@@ -331,12 +347,13 @@ def build_segmentation_training_jsons(
     path_to_seg dict (whose iteration order is not guaranteed to match entry order).
 
     Args:
-      data_dir         : folder with train.json / val.json / test.json (e.g. data/).
+      data_dir         : folder with train.jsonl / val.jsonl / test.jsonl (e.g. data/).
+                         Uses _find_split_jsonl() so non-standard names are supported.
       raw_dir          : root of the raw image tree (data/raw/) — used to mirror the
                          sub-folder structure into seg_dir (parity with depth).
       seg_dir          : where seg-ID PNGs are saved (data/raw_seg/).
-      output_dir       : where the three-field JSONs are written (data/seg_training/).
-      subset_n         : if set, only the first N entries per JSON (dry run).
+      output_dir       : where the three-field JSONLs are written (data/seg_training/).
+      subset_n         : if set, only the first N entries per JSONL (dry run).
       local_files_only : passed through to precompute_segmentation_maps -> encoder.
     """
     cwd         = Path.cwd()
@@ -344,22 +361,20 @@ def build_segmentation_training_jsons(
     raw_dir_abs = raw_dir if raw_dir.is_absolute() else cwd / raw_dir
 
     # num_classes for verification: derive from the palette constant (19 for Cityscapes).
-    # The encoder's in-loop check (ids_np.max() >= num_classes) is the primary guard;
-    # this just passes the same count to the JSON verifier.
     num_classes = len(SEG_CITYSCAPES_PALETTE)
 
-    for json_name in ["train.json", "val.json", "test.json"]:
-        src_path = data_dir / json_name
-        if not src_path.exists():
-            print(f"\n[WARN] {src_path} not found — skipping.")
+    for split in ["train", "val", "test"]:
+        src_path = _find_split_jsonl(data_dir, split)
+        if src_path is None:
+            print(f"\n[WARN] No JSONL for split '{split}' found in {data_dir} — skipping.")
             continue
 
         with open(src_path, "r", encoding="utf-8") as f:
-            all_entries = json.load(f)
+            all_entries = [json.loads(line) for line in f if line.strip()]
         entries = all_entries[:subset_n] if subset_n else all_entries
 
         print(f"\n{'='*56}")
-        print(f"  {json_name}: processing {len(entries)} entries"
+        print(f"  {src_path.name}: processing {len(entries)} entries"
               + (f" (dry-run subset of {len(all_entries)})" if subset_n else ""))
         print(f"{'='*56}")
 
@@ -411,15 +426,16 @@ def build_segmentation_training_jsons(
                 "prompt":         entry["prompt"],
             })
 
-        # Step 4: write output JSON.
-        out_path = output_dir / json_name
+        # Step 4: write output JSONL (one object per line).
+        out_path = output_dir / f"{split}.jsonl"
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(out_entries, f, indent=2, ensure_ascii=False)
+            for entry in out_entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         skip_note = f"  ({n_skipped} skipped due to seg errors)" if n_skipped else ""
         print(f"\n  Written {len(out_entries)} entries -> {out_path}{skip_note}")
 
         # Step 5: verify every entry (loud PASS/FAIL).
-        _verify_segmentation_training_json(out_path, num_classes=num_classes)
+        _verify_segmentation_training_jsonl(out_path, num_classes=num_classes)
 
 
 def run_seg_directory_mode(args):
@@ -462,7 +478,7 @@ def run_seg_directory_mode(args):
         input_dir=input_dir,
         local_files_only=args.local_files_only,
     )
-    print("\nNext step — build training JSONs with --data_dir, then train_seg.py")
+    print("\nNext step — build training JSONLs with --data_dir, then seg_training.py")
 
 
 def main():
@@ -473,8 +489,9 @@ def main():
     )
     parser.add_argument(
         "--data_dir", type=str, default=None,
-        help="Folder with train.json/val.json/test.json (e.g. data/). "
-             "Activates seg-training JSON mode -> data/seg_training/*.json.",
+        help="Folder with train.jsonl/val.jsonl/test.jsonl (e.g. data/). "
+             "Any *.jsonl whose stem contains 'train'/'val'/'test' is also accepted. "
+             "Activates seg-training JSONL mode -> data/seg_training/*.jsonl.",
     )
     parser.add_argument(
         "--raw_dir", type=str, default=None,
@@ -486,7 +503,7 @@ def main():
     )
     parser.add_argument(
         "--output_dir", type=str, default=None,
-        help="Output dir for the JSONs (default: <data_dir>/seg_training) "
+        help="Output dir for the JSONLs (default: <data_dir>/seg_training) "
              "or for PNGs in --input_dir mode.",
     )
     parser.add_argument(
@@ -495,7 +512,7 @@ def main():
     )
     parser.add_argument(
         "--dry_run_n", type=int, default=None,
-        help="Process only the first N entries per JSON (sanity run before full dataset).",
+        help="Process only the first N entries per JSONL (sanity run before full dataset).",
     )
     parser.add_argument(
         "--size", type=int, default=512,

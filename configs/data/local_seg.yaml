@@ -5,6 +5,9 @@ _target_: src.data.local_seg.SegJsonDataModule
 # NEAREST resize -> Cityscapes palette), so no seg-specific transform appears here.
 json_file:     ???
 val_json_file: null
+# image_root: null   # set to override image base path when images are not under repo root
+#                    # e.g. image_root: /mnt/datasets
+image_root: null
 size: ${size}
 batch_size: 4
 val_batch_size: 4       # 4 is safe under no_grad; matches depth default (was 1)
@@ -13,7 +16,7 @@ val_workers: 2
 
 # resize_mode: letterbox — SquarePad pads the shorter side (edge-replicated) before
 # Resize, keeping the full driving-scene frame. This RGB chain mirrors the SHARED
-# build_seg_square_preprocess() used by calculate_segmentation_map.py and inference_seg.py
+# build_seg_square_preprocess() used by seg_map_calculations.py and seg_inference.py
 # (resize_mode="letterbox"); keep them consistent so train RGB and live inference match.
 transform:
   - _target_: src.data.transforms.SquarePad      # pad shorter side -> square (edge-replicated)

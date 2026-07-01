@@ -132,8 +132,8 @@ data:
   val_workers: 2
 
   # resize_mode: letterbox  (active — SquarePad prepended to transform list in local_depth.yaml)
-  json_file:     data/depth_training/train.json   # built by pre_depth_calculations.py (has depth_path)
-  val_json_file: data/depth_training/val.json
+  json_file:     data/depth_training/train.jsonl   # built by depth_map_calculations.py (has depth_path)
+  val_json_file: data/depth_training/val.jsonl
 
 # =============================================================================
 # 3. GLOBAL FALLBACK PROMPT
