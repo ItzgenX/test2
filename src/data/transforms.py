@@ -1,6 +1,16 @@
-import torchvision.transforms.functional as TF
 from torchvision.transforms.v2 import Transform
 import torchvision.transforms.v2.functional as Fv2
+from PIL import Image, ImageFile
+
+# Tolerate minor JPEG defects (e.g. a missing/odd end-of-image marker) instead
+# of raising "image file is truncated". Pillow is intentionally strict here;
+# most other viewers/decoders (Windows Photo Viewer, browsers, libjpeg-turbo
+# used elsewhere) silently accept these same files. This flag is process-
+# global; it lives here because src/data/transforms.py is imported by all four
+# pipeline entrypoints (depth_map_calculations.py, seg_map_calculations.py,
+# depth_inference.py, seg_inference.py), so setting it once here covers every
+# place an image gets loaded — a single source of truth.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 class SquarePad:
@@ -25,6 +35,18 @@ class SquarePad:
       DPT model and produces a sharp artefact ring in the depth map at the
       pad boundary.  Repeating the edge pixel makes the transition smooth so
       depth estimation near the border is not disturbed.
+
+    IMPLEMENTATION NOTE (cross-platform bug fix): this used to call
+    torchvision.transforms.functional.pad(img, ..., padding_mode='edge') on a
+    PIL Image. That code path routes through torchvision's internal PIL/numpy
+    conversion for non-"constant" padding modes, which is NOT guaranteed
+    identical across torchvision versions/builds — this pipeline hit exactly
+    that: it worked in a Windows conda env and raised inside preprocess() on
+    an otherwise-valid image in a separate Linux conda env with a different
+    torchvision build. The fix below performs edge-replication with plain
+    PIL crop/resize/paste calls only (no torchvision.functional.pad, no numpy
+    conversion), which is stable, long-standing Pillow behaviour with no
+    torchvision-version dependency at all.
     """
 
     def __init__(self):
@@ -56,9 +78,35 @@ class SquarePad:
             pad_bottom / h,
         )
 
-        # TF.pad: padding = [left, top, right, bottom], padding_mode='edge'
-        return TF.pad(img, [pad_left, pad_top, pad_right, pad_bottom],
-                      padding_mode='edge')
+        # Manual edge-replication, pure PIL — no torchvision.functional.pad.
+        # Start from a blank canvas of the final square size and paste the
+        # original image into its offset position.
+        new_w = w + pad_left + pad_right
+        new_h = h + pad_top + pad_bottom
+        out = Image.new(img.mode, (new_w, new_h))
+        out.paste(img, (pad_left, pad_top))
+
+        # Stretch a 1px-wide/tall border strip from the ORIGINAL image across
+        # each padded region. Resizing a 1px-wide source has only one input
+        # value along that axis, so every resampling filter (nearest, bilinear,
+        # bicubic) reduces to plain repetition — this reproduces edge-replicate
+        # padding exactly, with zero dependency on any padding-mode internals.
+        # Only one pair (top/bottom) or the other (left/right) is ever non-zero
+        # at once, since only the shorter dimension is padded.
+        if pad_top > 0:
+            top_row = img.crop((0, 0, w, 1)).resize((w, pad_top))
+            out.paste(top_row, (pad_left, 0))
+        if pad_bottom > 0:
+            bottom_row = img.crop((0, h - 1, w, h)).resize((w, pad_bottom))
+            out.paste(bottom_row, (pad_left, pad_top + h))
+        if pad_left > 0:
+            left_col = img.crop((0, 0, 1, h)).resize((pad_left, h))
+            out.paste(left_col, (0, pad_top))
+        if pad_right > 0:
+            right_col = img.crop((w - 1, 0, w, h)).resize((pad_right, h))
+            out.paste(right_col, (pad_left + w, pad_top))
+
+        return out
 
 
 class TopCrop(Transform):

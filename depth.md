@@ -207,6 +207,8 @@ Our `SegmentationEncoder` in `src/encoders/seg_encoder.py` was deliberately desi
 
 **Triplication risk**: These three sites must stay byte-identical. If you change the preprocessing (e.g., add a normalisation step), update all three.
 
+**Cross-platform fix (2026-07-01, VERIFIED)**: `SquarePad` used to call `torchvision.transforms.functional.pad(img, ..., padding_mode='edge')`. This routes through torchvision's internal PIL/numpy conversion for non-`"constant"` padding modes, which is **not guaranteed identical across torchvision versions** — this pipeline hit exactly that: worked in a Windows conda env, threw inside `preprocess()` on a valid image in a separate Linux conda env with a different torchvision build (misleadingly reported as "could not load image" because the old error handling didn't distinguish a Pillow load failure from a preprocess failure — now split into two separate try/except blocks with distinct messages). Fixed by rewriting edge-replication using only plain PIL `crop()`/`resize()`/`paste()` calls — no `torchvision.functional.pad`, no numpy conversion, no version dependency. Verified bit-identical (`max abs pixel diff = 0`) against the old implementation on 3 real images before replacing it. Also added `PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True` (set once in `src/data/transforms.py`, which all 4 entrypoints import) to tolerate minor JPEG defects that some decoders accept and Pillow otherwise rejects with "image file is truncated".
+
 ### 5.2 Image Discovery and Path Control — how the pipeline finds your images
 
 This section answers: where does the pipeline look for images, what key in the JSONL tells it where the image is, and what do you change if your images live somewhere else?
